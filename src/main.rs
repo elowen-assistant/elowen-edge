@@ -27,6 +27,20 @@ struct RegisterDeviceRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct JobDispatchMessage {
+    job_id: String,
+    short_id: String,
+    thread_id: String,
+    title: String,
+    device_id: String,
+    repo_name: String,
+    base_branch: String,
+    branch_name: String,
+    request_text: String,
+    dispatched_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct AvailabilityProbeMessage {
     probe_id: String,
     job_id: Option<String>,
@@ -83,8 +97,44 @@ async fn main() -> anyhow::Result<()> {
         .subscribe(subject.clone())
         .await
         .context("failed to subscribe to availability probes")?;
+    let dispatch_subject = format!("elowen.jobs.dispatch.{}", config.device_id);
+    let mut dispatch_subscription = nats
+        .subscribe(dispatch_subject.clone())
+        .await
+        .context("failed to subscribe to job dispatch")?;
 
     info!(subject = %subject, "awaiting availability probes");
+    info!(subject = %dispatch_subject, "awaiting job dispatches");
+
+    let dispatch_device_id = config.device_id.clone();
+    tokio::spawn(async move {
+        while let Some(message) = dispatch_subscription.next().await {
+            let dispatch: JobDispatchMessage = match serde_json::from_slice(&message.payload) {
+                Ok(dispatch) => dispatch,
+                Err(error) => {
+                    warn!(error = %error, "failed to decode job dispatch");
+                    continue;
+                }
+            };
+
+            if dispatch.device_id != dispatch_device_id {
+                warn!(
+                    expected_device_id = %dispatch_device_id,
+                    received_device_id = %dispatch.device_id,
+                    "ignoring mismatched job dispatch"
+                );
+                continue;
+            }
+
+            info!(
+                job_id = %dispatch.job_id,
+                short_id = %dispatch.short_id,
+                repo_name = %dispatch.repo_name,
+                branch_name = %dispatch.branch_name,
+                "received job dispatch"
+            );
+        }
+    });
 
     while let Some(message) = subscription.next().await {
         let reply_subject = match message.reply.clone() {
