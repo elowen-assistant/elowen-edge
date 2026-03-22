@@ -10,6 +10,10 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app/target/release/elowen-edge /usr/local/bin/elowen-edge
 
 CMD ["elowen-edge"]

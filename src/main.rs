@@ -3,8 +3,14 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-use std::{env, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use serde_json::{Value, json};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{fs, io::AsyncWriteExt, process::Command, sync::Mutex};
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -16,6 +22,11 @@ struct EdgeConfig {
     primary_flag: bool,
     allowed_repos: Vec<String>,
     capabilities: Vec<String>,
+    workspace_root: PathBuf,
+    worktree_root: PathBuf,
+    codex_command: Option<String>,
+    codex_args: Vec<String>,
+    simulated_run_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -26,7 +37,7 @@ struct RegisterDeviceRequest {
     capabilities: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct JobDispatchMessage {
     job_id: String,
     short_id: String,
@@ -38,6 +49,20 @@ struct JobDispatchMessage {
     branch_name: String,
     request_text: String,
     dispatched_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobLifecycleEvent {
+    job_id: String,
+    device_id: String,
+    event_type: String,
+    status: Option<String>,
+    result: Option<String>,
+    failure_class: Option<String>,
+    worktree_path: Option<String>,
+    detail: Option<String>,
+    payload_json: Option<Value>,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +81,11 @@ struct AvailabilitySnapshot {
     available: bool,
     reason: String,
     responded_at: DateTime<Utc>,
+}
+
+struct CommandOutcome {
+    detail: String,
+    payload_json: Value,
 }
 
 #[tokio::main]
@@ -106,7 +136,9 @@ async fn main() -> anyhow::Result<()> {
     info!(subject = %subject, "awaiting availability probes");
     info!(subject = %dispatch_subject, "awaiting job dispatches");
 
-    let dispatch_device_id = config.device_id.clone();
+    let dispatch_config = config.clone();
+    let dispatch_nats = nats.clone();
+    let dispatch_active_job_id = active_job_id.clone();
     tokio::spawn(async move {
         while let Some(message) = dispatch_subscription.next().await {
             let dispatch: JobDispatchMessage = match serde_json::from_slice(&message.payload) {
@@ -117,9 +149,9 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            if dispatch.device_id != dispatch_device_id {
+            if dispatch.device_id != dispatch_config.device_id {
                 warn!(
-                    expected_device_id = %dispatch_device_id,
+                    expected_device_id = %dispatch_config.device_id,
                     received_device_id = %dispatch.device_id,
                     "ignoring mismatched job dispatch"
                 );
@@ -133,6 +165,17 @@ async fn main() -> anyhow::Result<()> {
                 branch_name = %dispatch.branch_name,
                 "received job dispatch"
             );
+
+            if let Err(error) = handle_job_dispatch(
+                dispatch,
+                dispatch_config.clone(),
+                dispatch_nats.clone(),
+                dispatch_active_job_id.clone(),
+            )
+            .await
+            {
+                warn!(error = %error, "job dispatch handler failed");
+            }
         }
     });
 
@@ -211,6 +254,14 @@ impl EdgeConfig {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| detect_device_name(&device_id));
+        let workspace_root = PathBuf::from(
+            env::var("ELOWEN_EDGE_WORKSPACE_ROOT").unwrap_or_else(|_| "/workspace".to_string()),
+        );
+        let worktree_root = env::var("ELOWEN_EDGE_WORKTREE_ROOT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace_root.join(".elowen").join("worktrees"));
 
         Ok(Self {
             api_url: env::var("ELOWEN_API_URL")
@@ -238,6 +289,17 @@ impl EdgeConfig {
                 "ELOWEN_DEVICE_CAPABILITIES",
                 &["codex", "git", "build", "test"],
             ),
+            workspace_root,
+            worktree_root,
+            codex_command: env::var("ELOWEN_CODEX_COMMAND")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            codex_args: parse_json_list_env("ELOWEN_CODEX_ARGS_JSON")?,
+            simulated_run_ms: env::var("ELOWEN_SIMULATED_RUN_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1500),
         })
     }
 }
@@ -279,6 +341,412 @@ async fn wait_for_registration(http: &HttpClient, config: &EdgeConfig) {
     }
 }
 
+async fn handle_job_dispatch(
+    dispatch: JobDispatchMessage,
+    config: EdgeConfig,
+    nats: async_nats::Client,
+    active_job_id: Arc<Mutex<Option<String>>>,
+) -> anyhow::Result<()> {
+    let busy_job_id = {
+        let mut guard = active_job_id.lock().await;
+        if let Some(current_job_id) = guard.clone() {
+            Some(current_job_id)
+        } else {
+            *guard = Some(dispatch.job_id.clone());
+            None
+        }
+    };
+
+    if let Some(current_job_id) = busy_job_id {
+        publish_job_event(
+            &nats,
+            JobLifecycleEvent {
+                job_id: dispatch.job_id.clone(),
+                device_id: config.device_id.clone(),
+                event_type: "job.rejected".to_string(),
+                status: Some("pending".to_string()),
+                result: None,
+                failure_class: None,
+                worktree_path: None,
+                detail: Some(format!(
+                    "edge device is already running active job {current_job_id}"
+                )),
+                payload_json: Some(json!({ "active_job_id": current_job_id })),
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let execution_result = run_job_execution(&dispatch, &config, &nats).await;
+
+    {
+        let mut guard = active_job_id.lock().await;
+        if guard.as_deref() == Some(dispatch.job_id.as_str()) {
+            *guard = None;
+        }
+    }
+
+    if let Err(error) = execution_result {
+        publish_job_event(
+            &nats,
+            JobLifecycleEvent {
+                job_id: dispatch.job_id.clone(),
+                device_id: config.device_id.clone(),
+                event_type: "job.failed".to_string(),
+                status: Some("failed".to_string()),
+                result: Some("failure".to_string()),
+                failure_class: Some("execution".to_string()),
+                worktree_path: None,
+                detail: Some(error.to_string()),
+                payload_json: None,
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn run_job_execution(
+    dispatch: &JobDispatchMessage,
+    config: &EdgeConfig,
+    nats: &async_nats::Client,
+) -> anyhow::Result<()> {
+    publish_job_event(
+        nats,
+        JobLifecycleEvent {
+            job_id: dispatch.job_id.clone(),
+            device_id: config.device_id.clone(),
+            event_type: "job.accepted".to_string(),
+            status: Some("accepted".to_string()),
+            result: None,
+            failure_class: None,
+            worktree_path: None,
+            detail: Some("edge accepted dispatched job".to_string()),
+            payload_json: Some(json!({
+                "repo_name": dispatch.repo_name,
+                "branch_name": dispatch.branch_name,
+                "base_branch": dispatch.base_branch,
+            })),
+            created_at: Utc::now(),
+        },
+    )
+    .await?;
+
+    let worktree_path = create_worktree(dispatch, config).await?;
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+
+    publish_job_event(
+        nats,
+        JobLifecycleEvent {
+            job_id: dispatch.job_id.clone(),
+            device_id: config.device_id.clone(),
+            event_type: "job.worktree_created".to_string(),
+            status: Some("accepted".to_string()),
+            result: None,
+            failure_class: None,
+            worktree_path: Some(worktree_path_str.clone()),
+            detail: Some("git worktree created for dispatched job".to_string()),
+            payload_json: Some(json!({
+                "repo_name": dispatch.repo_name,
+                "branch_name": dispatch.branch_name,
+                "base_branch": dispatch.base_branch,
+            })),
+            created_at: Utc::now(),
+        },
+    )
+    .await?;
+
+    publish_job_event(
+        nats,
+        JobLifecycleEvent {
+            job_id: dispatch.job_id.clone(),
+            device_id: config.device_id.clone(),
+            event_type: "job.started".to_string(),
+            status: Some("running".to_string()),
+            result: None,
+            failure_class: None,
+            worktree_path: Some(worktree_path_str.clone()),
+            detail: Some("job execution started".to_string()),
+            payload_json: None,
+            created_at: Utc::now(),
+        },
+    )
+    .await?;
+
+    let command_outcome = match run_codex_wrapper(dispatch, config, &worktree_path).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            publish_job_event(
+                nats,
+                JobLifecycleEvent {
+                    job_id: dispatch.job_id.clone(),
+                    device_id: config.device_id.clone(),
+                    event_type: "job.failed".to_string(),
+                    status: Some("failed".to_string()),
+                    result: Some("failure".to_string()),
+                    failure_class: Some("execution".to_string()),
+                    worktree_path: Some(worktree_path_str.clone()),
+                    detail: Some(error.to_string()),
+                    payload_json: None,
+                    created_at: Utc::now(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    publish_job_event(
+        nats,
+        JobLifecycleEvent {
+            job_id: dispatch.job_id.clone(),
+            device_id: config.device_id.clone(),
+            event_type: "job.completed".to_string(),
+            status: Some("completed".to_string()),
+            result: Some("success".to_string()),
+            failure_class: None,
+            worktree_path: Some(worktree_path_str),
+            detail: Some(command_outcome.detail),
+            payload_json: Some(command_outcome.payload_json),
+            created_at: Utc::now(),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn create_worktree(
+    dispatch: &JobDispatchMessage,
+    config: &EdgeConfig,
+) -> anyhow::Result<PathBuf> {
+    let repo_root = config.workspace_root.join(&dispatch.repo_name);
+    ensure_repo_root(&repo_root, &dispatch.repo_name).await?;
+
+    let worktree_parent = config.worktree_root.join(&dispatch.repo_name);
+    let worktree_path = worktree_parent.join(&dispatch.short_id);
+    fs::create_dir_all(&worktree_parent)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create worktree parent {}",
+                worktree_parent.display()
+            )
+        })?;
+
+    if fs::metadata(&worktree_path).await.is_ok() {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&worktree_path)
+            .output()
+            .await;
+        let _ = fs::remove_dir_all(&worktree_path).await;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args(["worktree", "add", "--force", "-B"])
+        .arg(&dispatch.branch_name)
+        .arg(&worktree_path)
+        .arg(&dispatch.base_branch)
+        .output()
+        .await
+        .with_context(|| format!("failed to create worktree for {}", dispatch.repo_name))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git worktree add failed: {}",
+            summarize_command_output(&output.stdout, &output.stderr)
+        );
+    }
+
+    write_job_request_files(dispatch, &worktree_path).await?;
+    Ok(worktree_path)
+}
+
+async fn run_codex_wrapper(
+    dispatch: &JobDispatchMessage,
+    config: &EdgeConfig,
+    worktree_path: &Path,
+) -> anyhow::Result<CommandOutcome> {
+    if let Some(command) = &config.codex_command {
+        return run_external_codex_wrapper(dispatch, config, worktree_path, command).await;
+    }
+
+    run_simulated_codex_wrapper(dispatch, config, worktree_path).await
+}
+
+async fn run_simulated_codex_wrapper(
+    dispatch: &JobDispatchMessage,
+    config: &EdgeConfig,
+    worktree_path: &Path,
+) -> anyhow::Result<CommandOutcome> {
+    tokio::time::sleep(Duration::from_millis(config.simulated_run_ms)).await;
+
+    let summary_path = worktree_path.join("elowen-job-summary.md");
+    let summary_body = format!(
+        "# Simulated Slice 4 Execution\n\n\
+        - Job: {}\n\
+        - Thread: {}\n\
+        - Repo: {}\n\
+        - Branch: {}\n\
+        - Base branch: {}\n\
+        - Runner: simulated\n\n\
+        ## Request\n\n{}\n",
+        dispatch.job_id,
+        dispatch.thread_id,
+        dispatch.repo_name,
+        dispatch.branch_name,
+        dispatch.base_branch,
+        dispatch.request_text
+    );
+
+    fs::write(&summary_path, summary_body)
+        .await
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+
+    Ok(CommandOutcome {
+        detail: "simulated Codex wrapper completed successfully".to_string(),
+        payload_json: json!({
+            "runner": "simulated",
+            "summary_path": summary_path.to_string_lossy().to_string(),
+        }),
+    })
+}
+
+async fn run_external_codex_wrapper(
+    dispatch: &JobDispatchMessage,
+    config: &EdgeConfig,
+    worktree_path: &Path,
+    command: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let output = Command::new(command)
+        .args(&config.codex_args)
+        .current_dir(worktree_path)
+        .env("ELOWEN_JOB_ID", &dispatch.job_id)
+        .env("ELOWEN_JOB_SHORT_ID", &dispatch.short_id)
+        .env("ELOWEN_THREAD_ID", &dispatch.thread_id)
+        .env("ELOWEN_JOB_TITLE", &dispatch.title)
+        .env("ELOWEN_REPO_NAME", &dispatch.repo_name)
+        .env("ELOWEN_BRANCH_NAME", &dispatch.branch_name)
+        .env("ELOWEN_BASE_BRANCH", &dispatch.base_branch)
+        .env("ELOWEN_WORKTREE_PATH", worktree_path)
+        .env("ELOWEN_REQUEST_TEXT", &dispatch.request_text)
+        .output()
+        .await
+        .with_context(|| format!("failed to run Codex wrapper command `{command}`"))?;
+
+    let stdout = truncate_text(&String::from_utf8_lossy(&output.stdout), 4000);
+    let stderr = truncate_text(&String::from_utf8_lossy(&output.stderr), 4000);
+    let log_path = worktree_path.join("elowen-runner-output.log");
+    let log_body = format!("stdout:\n{}\n\nstderr:\n{}\n", stdout, stderr);
+    fs::write(&log_path, log_body)
+        .await
+        .with_context(|| format!("failed to write {}", log_path.display()))?;
+
+    if !output.status.success() {
+        anyhow::bail!("Codex wrapper command failed with status {}", output.status);
+    }
+
+    Ok(CommandOutcome {
+        detail: format!("external Codex wrapper `{command}` completed successfully"),
+        payload_json: json!({
+            "runner": "external",
+            "command": command,
+            "args": config.codex_args.clone(),
+            "stdout": stdout,
+            "stderr": stderr,
+            "log_path": log_path.to_string_lossy().to_string(),
+        }),
+    })
+}
+
+async fn write_job_request_files(
+    dispatch: &JobDispatchMessage,
+    worktree_path: &Path,
+) -> anyhow::Result<()> {
+    let prompt_path = worktree_path.join("elowen-job-request.md");
+    let metadata_path = worktree_path.join(".elowen-job.json");
+
+    fs::write(
+        &prompt_path,
+        format!(
+            "# Elowen Job Request\n\n\
+            - Job: {}\n\
+            - Thread: {}\n\
+            - Repo: {}\n\
+            - Branch: {}\n\
+            - Base branch: {}\n\n\
+            ## Requested Work\n\n{}\n",
+            dispatch.job_id,
+            dispatch.thread_id,
+            dispatch.repo_name,
+            dispatch.branch_name,
+            dispatch.base_branch,
+            dispatch.request_text
+        ),
+    )
+    .await
+    .with_context(|| format!("failed to write {}", prompt_path.display()))?;
+
+    let metadata = serde_json::to_vec_pretty(&json!({
+        "job_id": dispatch.job_id,
+        "short_id": dispatch.short_id,
+        "thread_id": dispatch.thread_id,
+        "title": dispatch.title,
+        "repo_name": dispatch.repo_name,
+        "base_branch": dispatch.base_branch,
+        "branch_name": dispatch.branch_name,
+        "request_text": dispatch.request_text,
+        "dispatched_at": dispatch.dispatched_at,
+    }))
+    .context("failed to serialize job metadata")?;
+
+    let mut file = fs::File::create(&metadata_path)
+        .await
+        .with_context(|| format!("failed to create {}", metadata_path.display()))?;
+    file.write_all(&metadata)
+        .await
+        .with_context(|| format!("failed to write {}", metadata_path.display()))?;
+
+    Ok(())
+}
+
+async fn ensure_repo_root(repo_root: &Path, repo_name: &str) -> anyhow::Result<()> {
+    let metadata = fs::metadata(repo_root)
+        .await
+        .with_context(|| format!("workspace repository `{repo_name}` was not found"))?;
+
+    if !metadata.is_dir() {
+        anyhow::bail!("workspace repository `{repo_name}` is not a directory");
+    }
+
+    let git_dir = repo_root.join(".git");
+    if fs::metadata(&git_dir).await.is_err() {
+        anyhow::bail!("workspace repository `{repo_name}` is not a git checkout");
+    }
+
+    Ok(())
+}
+
+async fn publish_job_event(
+    nats: &async_nats::Client,
+    event: JobLifecycleEvent,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(&event).context("failed to serialize job lifecycle event")?;
+    nats.publish("elowen.jobs.events".to_string(), payload.into())
+        .await
+        .context("failed to publish job lifecycle event")?;
+    Ok(())
+}
+
 fn detect_device_id() -> String {
     env::var("COMPUTERNAME")
         .or_else(|_| env::var("HOSTNAME"))
@@ -315,4 +783,27 @@ fn parse_list_env(key: &str, default: &[&str]) -> Vec<String> {
     }
 
     items
+}
+
+fn parse_json_list_env(key: &str) -> anyhow::Result<Vec<String>> {
+    let Some(value) = env::var(key).ok().filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+
+    serde_json::from_str::<Vec<String>>(&value)
+        .with_context(|| format!("failed to parse {key} as a JSON string array"))
+}
+
+fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = truncate_text(&String::from_utf8_lossy(stdout), 1000);
+    let stderr = truncate_text(&String::from_utf8_lossy(stderr), 1000);
+    format!("stdout: {stdout}; stderr: {stderr}")
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut truncated = value.trim().chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
 }
