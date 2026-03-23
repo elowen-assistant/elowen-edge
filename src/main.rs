@@ -41,6 +41,7 @@ struct RegisterDeviceRequest {
 struct JobDispatchMessage {
     job_id: String,
     short_id: String,
+    correlation_id: String,
     thread_id: String,
     title: String,
     device_id: String,
@@ -54,6 +55,7 @@ struct JobDispatchMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JobLifecycleEvent {
     job_id: String,
+    correlation_id: String,
     device_id: String,
     event_type: String,
     status: Option<String>,
@@ -98,11 +100,32 @@ struct GitReport {
     changed_files: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn init_tracing(service_name: &'static str) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    let log_format = env::var("ELOWEN_LOG_FORMAT").unwrap_or_else(|_| "plain".to_string());
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true);
+
+    if log_format.eq_ignore_ascii_case("json") {
+        builder
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .flatten_event(true)
+            .with_ansi(false)
+            .init();
+    } else {
+        builder.with_ansi(true).init();
+    }
+
+    info!(service = service_name, log_format = %log_format, "tracing initialized");
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_tracing("elowen-edge");
 
     let config = EdgeConfig::from_env()?;
     let http = HttpClient::builder()
@@ -170,11 +193,14 @@ async fn main() -> anyhow::Result<()> {
 
             info!(
                 job_id = %dispatch.job_id,
+                correlation_id = %dispatch.correlation_id,
                 short_id = %dispatch.short_id,
                 repo_name = %dispatch.repo_name,
                 branch_name = %dispatch.branch_name,
                 "received job dispatch"
             );
+            let dispatch_job_id = dispatch.job_id.clone();
+            let dispatch_correlation_id = dispatch.correlation_id.clone();
 
             if let Err(error) = handle_job_dispatch(
                 dispatch,
@@ -184,7 +210,12 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             {
-                warn!(error = %error, "job dispatch handler failed");
+                warn!(
+                    job_id = %dispatch_job_id,
+                    correlation_id = %dispatch_correlation_id,
+                    error = %error,
+                    "job dispatch handler failed"
+                );
             }
         }
     });
@@ -372,6 +403,7 @@ async fn handle_job_dispatch(
             &nats,
             JobLifecycleEvent {
                 job_id: dispatch.job_id.clone(),
+                correlation_id: dispatch.correlation_id.clone(),
                 device_id: config.device_id.clone(),
                 event_type: "job.rejected".to_string(),
                 status: Some("pending".to_string()),
@@ -403,6 +435,7 @@ async fn handle_job_dispatch(
             &nats,
             JobLifecycleEvent {
                 job_id: dispatch.job_id.clone(),
+                correlation_id: dispatch.correlation_id.clone(),
                 device_id: config.device_id.clone(),
                 event_type: "job.failed".to_string(),
                 status: Some("failed".to_string()),
@@ -429,6 +462,7 @@ async fn run_job_execution(
         nats,
         JobLifecycleEvent {
             job_id: dispatch.job_id.clone(),
+            correlation_id: dispatch.correlation_id.clone(),
             device_id: config.device_id.clone(),
             event_type: "job.accepted".to_string(),
             status: Some("accepted".to_string()),
@@ -453,6 +487,7 @@ async fn run_job_execution(
         nats,
         JobLifecycleEvent {
             job_id: dispatch.job_id.clone(),
+            correlation_id: dispatch.correlation_id.clone(),
             device_id: config.device_id.clone(),
             event_type: "job.worktree_created".to_string(),
             status: Some("accepted".to_string()),
@@ -474,6 +509,7 @@ async fn run_job_execution(
         nats,
         JobLifecycleEvent {
             job_id: dispatch.job_id.clone(),
+            correlation_id: dispatch.correlation_id.clone(),
             device_id: config.device_id.clone(),
             event_type: "job.started".to_string(),
             status: Some("running".to_string()),
@@ -494,6 +530,7 @@ async fn run_job_execution(
                 nats,
                 JobLifecycleEvent {
                     job_id: dispatch.job_id.clone(),
+                    correlation_id: dispatch.correlation_id.clone(),
                     device_id: config.device_id.clone(),
                     event_type: "job.failed".to_string(),
                     status: Some("failed".to_string()),
@@ -514,6 +551,7 @@ async fn run_job_execution(
         nats,
         JobLifecycleEvent {
             job_id: dispatch.job_id.clone(),
+            correlation_id: dispatch.correlation_id.clone(),
             device_id: config.device_id.clone(),
             event_type: "job.completed".to_string(),
             status: Some("completed".to_string()),
@@ -535,6 +573,7 @@ async fn run_job_execution(
             nats,
             JobLifecycleEvent {
                 job_id: dispatch.job_id.clone(),
+                correlation_id: dispatch.correlation_id.clone(),
                 device_id: config.device_id.clone(),
                 event_type: "job.awaiting_approval".to_string(),
                 status: Some("awaiting_approval".to_string()),
@@ -914,6 +953,12 @@ async fn publish_job_event(
     nats.publish("elowen.jobs.events".to_string(), payload.into())
         .await
         .context("failed to publish job lifecycle event")?;
+    info!(
+        job_id = %event.job_id,
+        correlation_id = %event.correlation_id,
+        event_type = %event.event_type,
+        "published job lifecycle event"
+    );
     Ok(())
 }
 
