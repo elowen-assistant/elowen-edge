@@ -85,7 +85,17 @@ struct AvailabilitySnapshot {
 
 struct CommandOutcome {
     detail: String,
-    payload_json: Value,
+    result: String,
+    failure_class: Option<String>,
+    summary_markdown: String,
+    execution_report: Value,
+    approval_summary: Option<String>,
+}
+
+struct GitReport {
+    status_lines: Vec<String>,
+    diff_stat: Option<String>,
+    changed_files: Vec<String>,
 }
 
 #[tokio::main]
@@ -507,15 +517,40 @@ async fn run_job_execution(
             device_id: config.device_id.clone(),
             event_type: "job.completed".to_string(),
             status: Some("completed".to_string()),
-            result: Some("success".to_string()),
-            failure_class: None,
-            worktree_path: Some(worktree_path_str),
+            result: Some(command_outcome.result.clone()),
+            failure_class: command_outcome.failure_class.clone(),
+            worktree_path: Some(worktree_path_str.clone()),
             detail: Some(command_outcome.detail),
-            payload_json: Some(command_outcome.payload_json),
+            payload_json: Some(json!({
+                "summary_markdown": command_outcome.summary_markdown,
+                "execution_report": command_outcome.execution_report,
+            })),
             created_at: Utc::now(),
         },
     )
     .await?;
+
+    if let Some(approval_summary) = command_outcome.approval_summary {
+        publish_job_event(
+            nats,
+            JobLifecycleEvent {
+                job_id: dispatch.job_id.clone(),
+                device_id: config.device_id.clone(),
+                event_type: "job.awaiting_approval".to_string(),
+                status: Some("awaiting_approval".to_string()),
+                result: Some(command_outcome.result),
+                failure_class: command_outcome.failure_class,
+                worktree_path: Some(worktree_path_str),
+                detail: Some("push remains gated behind explicit approval".to_string()),
+                payload_json: Some(json!({
+                    "action_type": "push",
+                    "summary": approval_summary,
+                })),
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -612,12 +647,58 @@ async fn run_simulated_codex_wrapper(
         .await
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
 
+    let git_report = capture_git_report(worktree_path).await?;
+    let execution_report = json!({
+        "runner": "simulated",
+        "summary_path": summary_path.to_string_lossy().to_string(),
+        "build": {
+            "status": "not_run",
+            "reason": "no project-specific build command is configured in the Slice 5 scaffold"
+        },
+        "test": {
+            "status": "not_run",
+            "reason": "no project-specific test command is configured in the Slice 5 scaffold"
+        },
+        "git_status": git_report.status_lines,
+        "diff_stat": git_report.diff_stat,
+        "changed_files": git_report.changed_files,
+    });
+    let summary_markdown = format!(
+        "# Job Summary\n\n\
+        - Result: success\n\
+        - Runner: simulated\n\
+        - Repo: {}\n\
+        - Branch: {}\n\n\
+        ## Request\n\n{}\n\n\
+        ## Validation\n\n\
+        - Build: not run\n\
+        - Test: not run\n\n\
+        ## Workspace Changes\n\n\
+        - Changed entries: {}\n\
+        - Diff stat: {}\n",
+        dispatch.repo_name,
+        dispatch.branch_name,
+        dispatch.request_text,
+        git_report.changed_files.len(),
+        git_report
+            .diff_stat
+            .clone()
+            .unwrap_or_else(|| "no tracked diff".to_string()),
+    );
+    let approval_summary = Some(format!(
+        "Approve push for `{}` on branch `{}`. Review the generated summary and {} changed entries before pushing.",
+        dispatch.repo_name,
+        dispatch.branch_name,
+        git_report.changed_files.len(),
+    ));
+
     Ok(CommandOutcome {
         detail: "simulated Codex wrapper completed successfully".to_string(),
-        payload_json: json!({
-            "runner": "simulated",
-            "summary_path": summary_path.to_string_lossy().to_string(),
-        }),
+        result: "success".to_string(),
+        failure_class: None,
+        summary_markdown,
+        execution_report,
+        approval_summary,
     })
 }
 
@@ -655,16 +736,64 @@ async fn run_external_codex_wrapper(
         anyhow::bail!("Codex wrapper command failed with status {}", output.status);
     }
 
+    let git_report = capture_git_report(worktree_path).await?;
+    let execution_report = json!({
+        "runner": "external",
+        "command": command,
+        "args": config.codex_args.clone(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "log_path": log_path.to_string_lossy().to_string(),
+        "build": {
+            "status": "not_run",
+            "reason": "external runner did not emit a build report"
+        },
+        "test": {
+            "status": "not_run",
+            "reason": "external runner did not emit a test report"
+        },
+        "git_status": git_report.status_lines,
+        "diff_stat": git_report.diff_stat,
+        "changed_files": git_report.changed_files,
+    });
+    let summary_markdown = format!(
+        "# Job Summary\n\n\
+        - Result: success\n\
+        - Runner: external\n\
+        - Repo: {}\n\
+        - Branch: {}\n\n\
+        ## Request\n\n{}\n\n\
+        ## Runner Output\n\n\
+        - Command: `{}`\n\
+        - Log: `{}`\n\n\
+        ## Workspace Changes\n\n\
+        - Changed entries: {}\n\
+        - Diff stat: {}\n",
+        dispatch.repo_name,
+        dispatch.branch_name,
+        dispatch.request_text,
+        command,
+        log_path.to_string_lossy(),
+        git_report.changed_files.len(),
+        git_report
+            .diff_stat
+            .clone()
+            .unwrap_or_else(|| "no tracked diff".to_string()),
+    );
+    let approval_summary = Some(format!(
+        "Approve push for `{}` on branch `{}` after reviewing the external runner output and {} changed entries.",
+        dispatch.repo_name,
+        dispatch.branch_name,
+        git_report.changed_files.len(),
+    ));
+
     Ok(CommandOutcome {
         detail: format!("external Codex wrapper `{command}` completed successfully"),
-        payload_json: json!({
-            "runner": "external",
-            "command": command,
-            "args": config.codex_args.clone(),
-            "stdout": stdout,
-            "stderr": stderr,
-            "log_path": log_path.to_string_lossy().to_string(),
-        }),
+        result: "success".to_string(),
+        failure_class: None,
+        summary_markdown,
+        execution_report,
+        approval_summary,
     })
 }
 
@@ -717,6 +846,47 @@ async fn write_job_request_files(
         .with_context(|| format!("failed to write {}", metadata_path.display()))?;
 
     Ok(())
+}
+
+async fn capture_git_report(worktree_path: &Path) -> anyhow::Result<GitReport> {
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--short"])
+        .output()
+        .await
+        .context("failed to capture git status")?;
+    let diff_stat_output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["diff", "--stat"])
+        .output()
+        .await
+        .context("failed to capture git diff --stat")?;
+
+    let status_lines = String::from_utf8_lossy(&status_output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let changed_files = status_lines
+        .iter()
+        .map(|line| line.get(3..).unwrap_or(line.as_str()).trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let diff_stat = String::from_utf8_lossy(&diff_stat_output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(GitReport {
+        status_lines,
+        diff_stat: (!diff_stat.is_empty()).then_some(diff_stat),
+        changed_files,
+    })
 }
 
 async fn ensure_repo_root(repo_root: &Path, repo_name: &str) -> anyhow::Result<()> {
