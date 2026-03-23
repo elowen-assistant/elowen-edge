@@ -7,7 +7,7 @@ COPY src src
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM rust:1.88-bookworm
 WORKDIR /app
 
 RUN apt-get update \

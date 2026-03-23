@@ -8,7 +8,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{fs, io::AsyncWriteExt, process::Command, sync::Mutex};
 use tracing::{info, warn};
@@ -27,6 +27,7 @@ struct EdgeConfig {
     codex_command: Option<String>,
     codex_args: Vec<String>,
     simulated_run_ms: u64,
+    validation_timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +99,37 @@ struct GitReport {
     status_lines: Vec<String>,
     diff_stat: Option<String>,
     changed_files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AssistantConfig {
+    #[serde(default)]
+    validation: ValidationConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ValidationConfig {
+    build: Option<Vec<String>>,
+    test: Option<Vec<String>>,
+    working_dir: Option<String>,
+}
+
+struct ValidationPlan {
+    build: Option<CommandSpec>,
+    test: Option<CommandSpec>,
+    config_source: String,
+}
+
+struct CommandSpec {
+    argv: Vec<String>,
+    working_dir: PathBuf,
+}
+
+struct ValidationResults {
+    build: Value,
+    test: Value,
+    overall_success: bool,
+    config_source: String,
 }
 
 fn init_tracing(service_name: &'static str) {
@@ -341,6 +373,10 @@ impl EdgeConfig {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1500),
+            validation_timeout_secs: env::var("ELOWEN_VALIDATION_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(600),
         })
     }
 }
@@ -686,59 +722,17 @@ async fn run_simulated_codex_wrapper(
         .await
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
 
-    let git_report = capture_git_report(worktree_path).await?;
-    let execution_report = json!({
-        "runner": "simulated",
-        "summary_path": summary_path.to_string_lossy().to_string(),
-        "build": {
-            "status": "not_run",
-            "reason": "no project-specific build command is configured in the Slice 5 scaffold"
-        },
-        "test": {
-            "status": "not_run",
-            "reason": "no project-specific test command is configured in the Slice 5 scaffold"
-        },
-        "git_status": git_report.status_lines,
-        "diff_stat": git_report.diff_stat,
-        "changed_files": git_report.changed_files,
-    });
-    let summary_markdown = format!(
-        "# Job Summary\n\n\
-        - Result: success\n\
-        - Runner: simulated\n\
-        - Repo: {}\n\
-        - Branch: {}\n\n\
-        ## Request\n\n{}\n\n\
-        ## Validation\n\n\
-        - Build: not run\n\
-        - Test: not run\n\n\
-        ## Workspace Changes\n\n\
-        - Changed entries: {}\n\
-        - Diff stat: {}\n",
-        dispatch.repo_name,
-        dispatch.branch_name,
-        dispatch.request_text,
-        git_report.changed_files.len(),
-        git_report
-            .diff_stat
-            .clone()
-            .unwrap_or_else(|| "no tracked diff".to_string()),
-    );
-    let approval_summary = Some(format!(
-        "Approve push for `{}` on branch `{}`. Review the generated summary and {} changed entries before pushing.",
-        dispatch.repo_name,
-        dispatch.branch_name,
-        git_report.changed_files.len(),
-    ));
-
-    Ok(CommandOutcome {
-        detail: "simulated Codex wrapper completed successfully".to_string(),
-        result: "success".to_string(),
-        failure_class: None,
-        summary_markdown,
-        execution_report,
-        approval_summary,
-    })
+    finalize_command_outcome(
+        dispatch,
+        config,
+        worktree_path,
+        "simulated",
+        json!({
+            "summary_path": summary_path.to_string_lossy().to_string(),
+        }),
+        "simulated Codex wrapper completed successfully".to_string(),
+    )
+    .await
 }
 
 async fn run_external_codex_wrapper(
@@ -775,61 +769,108 @@ async fn run_external_codex_wrapper(
         anyhow::bail!("Codex wrapper command failed with status {}", output.status);
     }
 
+    finalize_command_outcome(
+        dispatch,
+        config,
+        worktree_path,
+        "external",
+        json!({
+            "command": command,
+            "args": config.codex_args.clone(),
+            "stdout": stdout,
+            "stderr": stderr,
+            "log_path": log_path.to_string_lossy().to_string(),
+        }),
+        format!("external Codex wrapper `{command}` completed successfully"),
+    )
+    .await
+}
+
+async fn finalize_command_outcome(
+    dispatch: &JobDispatchMessage,
+    config: &EdgeConfig,
+    worktree_path: &Path,
+    runner: &str,
+    runner_payload: Value,
+    base_detail: String,
+) -> anyhow::Result<CommandOutcome> {
+    let validation = run_validation_suite(config, worktree_path).await?;
     let git_report = capture_git_report(worktree_path).await?;
-    let execution_report = json!({
-        "runner": "external",
-        "command": command,
-        "args": config.codex_args.clone(),
-        "stdout": stdout,
-        "stderr": stderr,
-        "log_path": log_path.to_string_lossy().to_string(),
-        "build": {
-            "status": "not_run",
-            "reason": "external runner did not emit a build report"
-        },
-        "test": {
-            "status": "not_run",
-            "reason": "external runner did not emit a test report"
-        },
-        "git_status": git_report.status_lines,
-        "diff_stat": git_report.diff_stat,
-        "changed_files": git_report.changed_files,
-    });
+    let build_status = validation_status(&validation.build);
+    let test_status = validation_status(&validation.test);
+    let result = if validation.overall_success {
+        "success"
+    } else {
+        "failure"
+    };
+    let failure_class = if validation.overall_success {
+        None
+    } else {
+        Some("validation".to_string())
+    };
+    let detail = if validation.overall_success {
+        base_detail
+    } else {
+        format!(
+            "validation failed after Codex execution (build: {build_status}, test: {test_status})"
+        )
+    };
+
+    let mut execution_report = serde_json::Map::new();
+    execution_report.insert("runner".to_string(), json!(runner));
+    if let Some(object) = runner_payload.as_object() {
+        for (key, value) in object {
+            execution_report.insert(key.clone(), value.clone());
+        }
+    }
+    execution_report.insert(
+        "validation_config_source".to_string(),
+        json!(validation.config_source),
+    );
+    execution_report.insert("build".to_string(), validation.build.clone());
+    execution_report.insert("test".to_string(), validation.test.clone());
+    execution_report.insert("git_status".to_string(), json!(git_report.status_lines));
+    execution_report.insert("diff_stat".to_string(), json!(git_report.diff_stat));
+    execution_report.insert("changed_files".to_string(), json!(git_report.changed_files));
+    let execution_report = Value::Object(execution_report);
+
     let summary_markdown = format!(
         "# Job Summary\n\n\
-        - Result: success\n\
-        - Runner: external\n\
+        - Result: {result}\n\
+        - Runner: {runner}\n\
         - Repo: {}\n\
-        - Branch: {}\n\n\
+        - Branch: {}\n\
+        - Validation config: {}\n\n\
         ## Request\n\n{}\n\n\
-        ## Runner Output\n\n\
-        - Command: `{}`\n\
-        - Log: `{}`\n\n\
+        ## Validation\n\n\
+        - Build: {build_status}\n\
+        - Test: {test_status}\n\n\
         ## Workspace Changes\n\n\
         - Changed entries: {}\n\
         - Diff stat: {}\n",
         dispatch.repo_name,
         dispatch.branch_name,
+        validation.config_source,
         dispatch.request_text,
-        command,
-        log_path.to_string_lossy(),
         git_report.changed_files.len(),
         git_report
             .diff_stat
             .clone()
             .unwrap_or_else(|| "no tracked diff".to_string()),
     );
-    let approval_summary = Some(format!(
-        "Approve push for `{}` on branch `{}` after reviewing the external runner output and {} changed entries.",
-        dispatch.repo_name,
-        dispatch.branch_name,
-        git_report.changed_files.len(),
-    ));
+    let approval_summary = validation.overall_success.then(|| {
+        format!(
+            "Approve push for `{}` on branch `{}` after reviewing the generated summary, validation output, and {} changed entries.",
+            dispatch.repo_name,
+            dispatch.branch_name,
+            git_report.changed_files.len(),
+        )
+    });
 
     Ok(CommandOutcome {
-        detail: format!("external Codex wrapper `{command}` completed successfully"),
-        result: "success".to_string(),
-        failure_class: None,
+        detail,
+        result: result.to_string(),
+        failure_class,
         summary_markdown,
         execution_report,
         approval_summary,
@@ -926,6 +967,191 @@ async fn capture_git_report(worktree_path: &Path) -> anyhow::Result<GitReport> {
         diff_stat: (!diff_stat.is_empty()).then_some(diff_stat),
         changed_files,
     })
+}
+
+async fn run_validation_suite(
+    config: &EdgeConfig,
+    worktree_path: &Path,
+) -> anyhow::Result<ValidationResults> {
+    let plan = load_validation_plan(worktree_path).await?;
+    let build = match plan.build {
+        Some(spec) => {
+            execute_validation_command("build", spec, config.validation_timeout_secs).await
+        }
+        None => json!({
+            "status": "not_configured",
+            "reason": "no build command is configured for this repository",
+        }),
+    };
+
+    let test = if validation_status(&build) == "failed" {
+        json!({
+            "status": "skipped",
+            "reason": "test command was skipped because the build command failed",
+        })
+    } else {
+        match plan.test {
+            Some(spec) => {
+                execute_validation_command("test", spec, config.validation_timeout_secs).await
+            }
+            None => json!({
+                "status": "not_configured",
+                "reason": "no test command is configured for this repository",
+            }),
+        }
+    };
+
+    let overall_success =
+        validation_status(&build) != "failed" && validation_status(&test) != "failed";
+
+    Ok(ValidationResults {
+        build,
+        test,
+        overall_success,
+        config_source: plan.config_source,
+    })
+}
+
+async fn load_validation_plan(worktree_path: &Path) -> anyhow::Result<ValidationPlan> {
+    let config_path = worktree_path.join(".assistant").join("config.toml");
+    if fs::metadata(&config_path).await.is_ok() {
+        let contents = fs::read_to_string(&config_path)
+            .await
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let assistant_config = toml::from_str::<AssistantConfig>(&contents)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?;
+        return build_validation_plan(
+            worktree_path,
+            assistant_config.validation,
+            format!("repo config at {}", config_path.display()),
+        );
+    }
+
+    if fs::metadata(worktree_path.join("Cargo.toml")).await.is_ok() {
+        return build_validation_plan(
+            worktree_path,
+            ValidationConfig {
+                build: Some(vec!["cargo".to_string(), "check".to_string()]),
+                test: Some(vec![
+                    "cargo".to_string(),
+                    "test".to_string(),
+                    "--quiet".to_string(),
+                ]),
+                working_dir: None,
+            },
+            "inferred from Cargo.toml".to_string(),
+        );
+    }
+
+    Ok(ValidationPlan {
+        build: None,
+        test: None,
+        config_source: "no repository validation config found".to_string(),
+    })
+}
+
+fn build_validation_plan(
+    worktree_path: &Path,
+    config: ValidationConfig,
+    config_source: String,
+) -> anyhow::Result<ValidationPlan> {
+    let working_dir = resolve_working_dir(worktree_path, config.working_dir.as_deref())?;
+    Ok(ValidationPlan {
+        build: build_command_spec(config.build, &working_dir)?,
+        test: build_command_spec(config.test, &working_dir)?,
+        config_source,
+    })
+}
+
+fn resolve_working_dir(
+    worktree_path: &Path,
+    configured_dir: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let Some(configured_dir) = configured_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(worktree_path.to_path_buf());
+    };
+
+    let resolved = worktree_path.join(configured_dir);
+    if !resolved.exists() {
+        anyhow::bail!(
+            "configured validation working_dir does not exist: {}",
+            resolved.display()
+        );
+    }
+
+    Ok(resolved)
+}
+
+fn build_command_spec(
+    argv: Option<Vec<String>>,
+    working_dir: &Path,
+) -> anyhow::Result<Option<CommandSpec>> {
+    let Some(argv) = argv else {
+        return Ok(None);
+    };
+
+    let argv = argv
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if argv.is_empty() {
+        anyhow::bail!("validation command entries must not be empty");
+    }
+
+    Ok(Some(CommandSpec {
+        argv,
+        working_dir: working_dir.to_path_buf(),
+    }))
+}
+
+async fn execute_validation_command(kind: &str, spec: CommandSpec, timeout_secs: u64) -> Value {
+    let started_at = Utc::now();
+    let started = Instant::now();
+    let mut command = Command::new(&spec.argv[0]);
+    command.args(&spec.argv[1..]).current_dir(&spec.working_dir);
+
+    let working_dir = spec.working_dir.to_string_lossy().to_string();
+    let argv = spec.argv;
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), command.output()).await {
+        Err(_) => json!({
+            "status": "failed",
+            "command": argv,
+            "working_dir": working_dir,
+            "started_at": started_at,
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "reason": format!("{kind} command timed out after {timeout_secs} seconds"),
+        }),
+        Ok(Err(error)) => json!({
+            "status": "failed",
+            "command": argv,
+            "working_dir": working_dir,
+            "started_at": started_at,
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "reason": error.to_string(),
+        }),
+        Ok(Ok(output)) => json!({
+            "status": if output.status.success() { "passed" } else { "failed" },
+            "command": argv,
+            "working_dir": working_dir,
+            "started_at": started_at,
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "exit_code": output.status.code(),
+            "stdout": truncate_text(&String::from_utf8_lossy(&output.stdout), 4000),
+            "stderr": truncate_text(&String::from_utf8_lossy(&output.stderr), 4000),
+        }),
+    }
+}
+
+fn validation_status(report: &Value) -> &str {
+    report
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
 }
 
 async fn ensure_repo_root(repo_root: &Path, repo_name: &str) -> anyhow::Result<()> {
