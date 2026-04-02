@@ -5,13 +5,20 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    env,
+    collections::HashMap,
+    env, fs as stdfs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{fs, io::AsyncWriteExt, process::Command, sync::Mutex};
 use tracing::{info, warn};
+
+type EnvOverlay = HashMap<String, String>;
+
+struct StartupOptions {
+    env_file: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 struct EdgeConfig {
@@ -132,10 +139,13 @@ struct ValidationResults {
     config_source: String,
 }
 
-fn init_tracing(service_name: &'static str) {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let log_format = env::var("ELOWEN_LOG_FORMAT").unwrap_or_else(|_| "plain".to_string());
+fn init_tracing(service_name: &'static str, env_overlay: &EnvOverlay) {
+    let env_filter = env_value("RUST_LOG", env_overlay)
+        .map(tracing_subscriber::EnvFilter::new)
+        .or_else(|| tracing_subscriber::EnvFilter::try_from_default_env().ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
+    let log_format =
+        env_value("ELOWEN_LOG_FORMAT", env_overlay).unwrap_or_else(|| "plain".to_string());
     let builder = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(true);
@@ -155,11 +165,25 @@ fn init_tracing(service_name: &'static str) {
     info!(service = service_name, log_format = %log_format, "tracing initialized");
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    init_tracing("elowen-edge");
+fn main() -> anyhow::Result<()> {
+    let startup = parse_startup_options()?;
+    let env_overlay = load_env_overlay(startup.env_file.as_deref())?;
+    init_tracing("elowen-edge", &env_overlay);
 
-    let config = EdgeConfig::from_env()?;
+    if let Some(env_file) = startup.env_file.as_ref() {
+        info!(path = %env_file.display(), "loaded edge env file");
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    runtime.block_on(async_main(env_overlay))
+}
+
+async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
+    let config = EdgeConfig::from_env(&env_overlay)?;
     let http = HttpClient::builder()
         .build()
         .context("failed to build HTTP client")?;
@@ -318,34 +342,28 @@ async fn main() -> anyhow::Result<()> {
 }
 
 impl EdgeConfig {
-    fn from_env() -> anyhow::Result<Self> {
-        let device_id = env::var("ELOWEN_DEVICE_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(detect_device_id);
-        let device_name = env::var("ELOWEN_DEVICE_NAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+    fn from_env(env_overlay: &EnvOverlay) -> anyhow::Result<Self> {
+        let device_id = env_value("ELOWEN_DEVICE_ID", env_overlay).unwrap_or_else(detect_device_id);
+        let device_name = env_value("ELOWEN_DEVICE_NAME", env_overlay)
             .unwrap_or_else(|| detect_device_name(&device_id));
         let workspace_root = PathBuf::from(
-            env::var("ELOWEN_EDGE_WORKSPACE_ROOT").unwrap_or_else(|_| "/workspace".to_string()),
+            env_value("ELOWEN_EDGE_WORKSPACE_ROOT", env_overlay)
+                .unwrap_or_else(|| "/workspace".to_string()),
         );
-        let worktree_root = env::var("ELOWEN_EDGE_WORKTREE_ROOT")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+        let worktree_root = env_value("ELOWEN_EDGE_WORKTREE_ROOT", env_overlay)
             .map(PathBuf::from)
             .unwrap_or_else(|| workspace_root.join(".elowen").join("worktrees"));
 
         Ok(Self {
-            api_url: env::var("ELOWEN_API_URL")
-                .unwrap_or_else(|_| "http://elowen-api:8080".to_string())
+            api_url: env_value("ELOWEN_API_URL", env_overlay)
+                .unwrap_or_else(|| "http://elowen-api:8080".to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            nats_url: env::var("ELOWEN_NATS_URL").context("missing ELOWEN_NATS_URL")?,
+            nats_url: env_value("ELOWEN_NATS_URL", env_overlay)
+                .context("missing ELOWEN_NATS_URL")?,
             device_id,
             device_name,
-            primary_flag: env::var("ELOWEN_DEVICE_PRIMARY")
-                .ok()
+            primary_flag: env_value("ELOWEN_DEVICE_PRIMARY", env_overlay)
                 .map(|value| parse_bool(&value))
                 .unwrap_or(true),
             allowed_repos: parse_list_env(
@@ -357,24 +375,21 @@ impl EdgeConfig {
                     "elowen-notes",
                     "elowen-platform",
                 ],
+                env_overlay,
             ),
             capabilities: parse_list_env(
                 "ELOWEN_DEVICE_CAPABILITIES",
                 &["codex", "git", "build", "test"],
+                env_overlay,
             ),
             workspace_root,
             worktree_root,
-            codex_command: env::var("ELOWEN_CODEX_COMMAND")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            codex_args: parse_json_list_env("ELOWEN_CODEX_ARGS_JSON")?,
-            simulated_run_ms: env::var("ELOWEN_SIMULATED_RUN_MS")
-                .ok()
+            codex_command: env_value("ELOWEN_CODEX_COMMAND", env_overlay),
+            codex_args: parse_json_list_env("ELOWEN_CODEX_ARGS_JSON", env_overlay)?,
+            simulated_run_ms: env_value("ELOWEN_SIMULATED_RUN_MS", env_overlay)
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1500),
-            validation_timeout_secs: env::var("ELOWEN_VALIDATION_TIMEOUT_SECS")
-                .ok()
+            validation_timeout_secs: env_value("ELOWEN_VALIDATION_TIMEOUT_SECS", env_overlay)
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(600),
         })
@@ -1210,8 +1225,8 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
-fn parse_list_env(key: &str, default: &[&str]) -> Vec<String> {
-    let value = env::var(key).unwrap_or_else(|_| default.join(","));
+fn parse_list_env(key: &str, default: &[&str], env_overlay: &EnvOverlay) -> Vec<String> {
+    let value = env_value(key, env_overlay).unwrap_or_else(|| default.join(","));
     let mut items = Vec::new();
 
     for candidate in value.split(',') {
@@ -1226,13 +1241,109 @@ fn parse_list_env(key: &str, default: &[&str]) -> Vec<String> {
     items
 }
 
-fn parse_json_list_env(key: &str) -> anyhow::Result<Vec<String>> {
-    let Some(value) = env::var(key).ok().filter(|value| !value.trim().is_empty()) else {
+fn parse_json_list_env(key: &str, env_overlay: &EnvOverlay) -> anyhow::Result<Vec<String>> {
+    let Some(value) = env_value(key, env_overlay) else {
         return Ok(Vec::new());
     };
 
     serde_json::from_str::<Vec<String>>(&value)
         .with_context(|| format!("failed to parse {key} as a JSON string array"))
+}
+
+fn parse_startup_options() -> anyhow::Result<StartupOptions> {
+    let mut env_file = None;
+    let mut args = env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--env-file" => {
+                let value = args.next().context("missing value after --env-file")?;
+                env_file = Some(PathBuf::from(value));
+            }
+            "--help" | "-h" => {
+                print!("{}", startup_usage());
+                std::process::exit(0);
+            }
+            _ => anyhow::bail!("unsupported argument `{arg}`\n\n{}", startup_usage()),
+        }
+    }
+
+    if env_file.is_none() {
+        env_file = env::var("ELOWEN_EDGE_ENV_FILE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+    }
+
+    Ok(StartupOptions { env_file })
+}
+
+fn startup_usage() -> &'static str {
+    "Usage: elowen-edge [--env-file PATH]\n\n\
+Reads runtime configuration from the process environment. When --env-file is set,\n\
+the file is parsed first and the current process environment still wins on conflicts.\n\
+You can also set ELOWEN_EDGE_ENV_FILE instead of passing --env-file.\n"
+}
+
+fn load_env_overlay(env_file: Option<&Path>) -> anyhow::Result<EnvOverlay> {
+    let Some(env_file) = env_file else {
+        return Ok(EnvOverlay::new());
+    };
+
+    let contents = stdfs::read_to_string(env_file)
+        .with_context(|| format!("failed to read env file {}", env_file.display()))?;
+    let mut env_overlay = EnvOverlay::new();
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (key, raw_value) = line.split_once('=').with_context(|| {
+            format!(
+                "invalid env assignment in {} at line {}",
+                env_file.display(),
+                index + 1
+            )
+        })?;
+
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!(
+                "invalid empty env key in {} at line {}",
+                env_file.display(),
+                index + 1
+            );
+        }
+
+        env_overlay.insert(key.to_string(), parse_env_file_value(raw_value.trim()));
+    }
+
+    Ok(env_overlay)
+}
+
+fn parse_env_file_value(raw_value: &str) -> String {
+    if raw_value.len() >= 2 {
+        let bytes = raw_value.as_bytes();
+        let is_quoted = (bytes[0] == b'"' && bytes[raw_value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[raw_value.len() - 1] == b'\'');
+        if is_quoted {
+            return raw_value[1..raw_value.len() - 1].to_string();
+        }
+    }
+
+    raw_value.to_string()
+}
+
+fn env_value(key: &str, env_overlay: &EnvOverlay) -> Option<String> {
+    env_overlay
+        .get(key)
+        .cloned()
+        .or_else(|| env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> String {
