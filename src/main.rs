@@ -36,6 +36,7 @@ struct EdgeConfig {
     codex_args: Vec<String>,
     simulated_run_ms: u64,
     validation_timeout_secs: u64,
+    sandbox_mode: SandboxMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,6 +141,25 @@ struct ValidationResults {
     config_source: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SandboxMode {
+    Off,
+    Workspace,
+}
+
+#[derive(Clone)]
+struct SandboxPolicy {
+    mode: SandboxMode,
+    worktree_path: PathBuf,
+    sandbox_root: PathBuf,
+    temp_root: PathBuf,
+    cache_root: PathBuf,
+    policy_path: PathBuf,
+}
+
+const SANDBOX_ERROR_PREFIX: &str = "sandbox blocked: ";
+
 fn init_tracing(service_name: &'static str, env_overlay: &EnvOverlay) {
     let env_filter = env_value("RUST_LOG", env_overlay)
         .map(tracing_subscriber::EnvFilter::new)
@@ -185,6 +205,10 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
     let config = EdgeConfig::from_env(&env_overlay)?;
+    info!(
+        sandbox_mode = %config.sandbox_mode.as_str(),
+        "edge sandbox mode configured"
+    );
     preflight_codex_runner(&config).await?;
     let http = HttpClient::builder()
         .build()
@@ -394,7 +418,35 @@ impl EdgeConfig {
             validation_timeout_secs: env_value("ELOWEN_VALIDATION_TIMEOUT_SECS", env_overlay)
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(600),
+            sandbox_mode: SandboxMode::from_env(
+                env_value("ELOWEN_SANDBOX_MODE", env_overlay).as_deref(),
+            )?,
         })
+    }
+}
+
+impl SandboxMode {
+    fn from_env(value: Option<&str>) -> anyhow::Result<Self> {
+        let normalized = value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("workspace")
+            .to_ascii_lowercase();
+
+        match normalized.as_str() {
+            "off" => Ok(Self::Off),
+            "workspace" => Ok(Self::Workspace),
+            _ => anyhow::bail!(
+                "unsupported ELOWEN_SANDBOX_MODE `{normalized}`; expected `workspace` or `off`"
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Workspace => "workspace",
+        }
     }
 }
 
@@ -579,6 +631,7 @@ async fn run_job_execution(
     let command_outcome = match run_codex_wrapper(dispatch, config, &worktree_path).await {
         Ok(outcome) => outcome,
         Err(error) => {
+            let (failure_class, detail) = classify_failure(&error);
             publish_job_event(
                 nats,
                 JobLifecycleEvent {
@@ -588,9 +641,9 @@ async fn run_job_execution(
                     event_type: "job.failed".to_string(),
                     status: Some("failed".to_string()),
                     result: Some("failure".to_string()),
-                    failure_class: Some("execution".to_string()),
+                    failure_class: Some(failure_class),
                     worktree_path: Some(worktree_path_str.clone()),
-                    detail: Some(error.to_string()),
+                    detail: Some(detail),
                     payload_json: None,
                     created_at: Utc::now(),
                 },
@@ -703,21 +756,22 @@ async fn run_codex_wrapper(
     config: &EdgeConfig,
     worktree_path: &Path,
 ) -> anyhow::Result<CommandOutcome> {
+    let sandbox = prepare_sandbox_policy(config, worktree_path).await?;
     if let Some(command) = &config.codex_command {
-        return run_codex_cli(dispatch, config, worktree_path, command).await;
+        return run_codex_cli(dispatch, config, &sandbox, command).await;
     }
 
-    run_simulated_codex_wrapper(dispatch, config, worktree_path).await
+    run_simulated_codex_wrapper(dispatch, config, &sandbox).await
 }
 
 async fn run_simulated_codex_wrapper(
     dispatch: &JobDispatchMessage,
     config: &EdgeConfig,
-    worktree_path: &Path,
+    sandbox: &SandboxPolicy,
 ) -> anyhow::Result<CommandOutcome> {
     tokio::time::sleep(Duration::from_millis(config.simulated_run_ms)).await;
 
-    let summary_path = worktree_path.join("elowen-job-summary.md");
+    let summary_path = sandbox.worktree_path.join("elowen-job-summary.md");
     let summary_body = format!(
         "# Simulated Slice 4 Execution\n\n\
         - Job: {}\n\
@@ -742,7 +796,7 @@ async fn run_simulated_codex_wrapper(
     finalize_command_outcome(
         dispatch,
         config,
-        worktree_path,
+        sandbox,
         "simulated",
         json!({
             "summary_path": summary_path.to_string_lossy().to_string(),
@@ -755,20 +809,27 @@ async fn run_simulated_codex_wrapper(
 async fn run_codex_cli(
     dispatch: &JobDispatchMessage,
     config: &EdgeConfig,
-    worktree_path: &Path,
+    sandbox: &SandboxPolicy,
     command: &str,
 ) -> anyhow::Result<CommandOutcome> {
-    let prompt_path = worktree_path.join("elowen-job-request.md");
+    let prompt_path = sandbox.worktree_path.join("elowen-job-request.md");
     let prompt_body = fs::read_to_string(&prompt_path)
         .await
         .with_context(|| format!("failed to read {}", prompt_path.display()))?;
-    let output_path = worktree_path.join("elowen-runner-output.jsonl");
-    let error_path = worktree_path.join("elowen-runner-error.log");
-    let last_message_path = worktree_path.join("elowen-codex-last-message.txt");
-    let args = build_codex_exec_args(config, worktree_path, &last_message_path)?;
-    let mut child = Command::new(command)
+    let output_path = sandbox.worktree_path.join("elowen-runner-output.jsonl");
+    let error_path = sandbox.worktree_path.join("elowen-runner-error.log");
+    let last_message_path = sandbox.worktree_path.join("elowen-codex-last-message.txt");
+    let args = build_codex_exec_args(config, &sandbox.worktree_path, &last_message_path)?;
+    let working_dir = enforce_worktree_containment(
+        &sandbox.worktree_path,
+        &sandbox.worktree_path,
+        "Codex working directory",
+    )
+    .await?;
+    let mut child = Command::new(command);
+    child
         .args(&args)
-        .current_dir(worktree_path)
+        .current_dir(&working_dir)
         .env("ELOWEN_JOB_ID", &dispatch.job_id)
         .env("ELOWEN_JOB_SHORT_ID", &dispatch.short_id)
         .env("ELOWEN_THREAD_ID", &dispatch.thread_id)
@@ -776,11 +837,13 @@ async fn run_codex_cli(
         .env("ELOWEN_REPO_NAME", &dispatch.repo_name)
         .env("ELOWEN_BRANCH_NAME", &dispatch.branch_name)
         .env("ELOWEN_BASE_BRANCH", &dispatch.base_branch)
-        .env("ELOWEN_WORKTREE_PATH", worktree_path)
+        .env("ELOWEN_WORKTREE_PATH", &sandbox.worktree_path)
         .env("ELOWEN_REQUEST_TEXT", &dispatch.request_text)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_sandbox_environment(&mut child, sandbox);
+    let mut child = child
         .spawn()
         .with_context(|| format!("failed to start Codex CLI `{command}`"))?;
 
@@ -827,7 +890,7 @@ async fn run_codex_cli(
     finalize_command_outcome(
         dispatch,
         config,
-        worktree_path,
+        sandbox,
         "codex-cli",
         json!({
             "command": command,
@@ -849,15 +912,17 @@ async fn run_codex_cli(
 async fn finalize_command_outcome(
     dispatch: &JobDispatchMessage,
     config: &EdgeConfig,
-    worktree_path: &Path,
+    sandbox: &SandboxPolicy,
     runner: &str,
     runner_payload: Value,
     base_detail: String,
 ) -> anyhow::Result<CommandOutcome> {
-    let validation = run_validation_suite(config, worktree_path).await?;
-    let git_report = capture_git_report(worktree_path).await?;
+    let validation = run_validation_suite(config, &sandbox.worktree_path, sandbox).await?;
+    let git_report = capture_git_report(&sandbox.worktree_path).await?;
     let build_status = validation_status(&validation.build);
     let test_status = validation_status(&validation.test);
+    let sandbox_blocked =
+        matches!(build_status, "sandbox_blocked") || matches!(test_status, "sandbox_blocked");
     let result = if validation.overall_success {
         "success"
     } else {
@@ -865,11 +930,17 @@ async fn finalize_command_outcome(
     };
     let failure_class = if validation.overall_success {
         None
+    } else if sandbox_blocked {
+        Some("sandbox".to_string())
     } else {
         Some("validation".to_string())
     };
     let detail = if validation.overall_success {
         base_detail
+    } else if sandbox_blocked {
+        format!(
+            "sandbox blocked post-execution validation (build: {build_status}, test: {test_status})"
+        )
     } else {
         format!(
             "validation failed after Codex execution (build: {build_status}, test: {test_status})"
@@ -892,6 +963,7 @@ async fn finalize_command_outcome(
     execution_report.insert("git_status".to_string(), json!(git_report.status_lines));
     execution_report.insert("diff_stat".to_string(), json!(git_report.diff_stat));
     execution_report.insert("changed_files".to_string(), json!(git_report.changed_files));
+    execution_report.insert("sandbox".to_string(), sandbox_report_value(sandbox));
     let execution_report = Value::Object(execution_report);
 
     let summary_markdown = format!(
@@ -1032,11 +1104,12 @@ async fn capture_git_report(worktree_path: &Path) -> anyhow::Result<GitReport> {
 async fn run_validation_suite(
     config: &EdgeConfig,
     worktree_path: &Path,
+    sandbox: &SandboxPolicy,
 ) -> anyhow::Result<ValidationResults> {
     let plan = load_validation_plan(worktree_path).await?;
     let build = match plan.build {
         Some(spec) => {
-            execute_validation_command("build", spec, config.validation_timeout_secs).await
+            execute_validation_command("build", spec, config.validation_timeout_secs, sandbox).await
         }
         None => json!({
             "status": "not_configured",
@@ -1049,10 +1122,16 @@ async fn run_validation_suite(
             "status": "skipped",
             "reason": "test command was skipped because the build command failed",
         })
+    } else if validation_status(&build) == "sandbox_blocked" {
+        json!({
+            "status": "skipped",
+            "reason": "test command was skipped because the build command was blocked by the sandbox",
+        })
     } else {
         match plan.test {
             Some(spec) => {
-                execute_validation_command("test", spec, config.validation_timeout_secs).await
+                execute_validation_command("test", spec, config.validation_timeout_secs, sandbox)
+                    .await
             }
             None => json!({
                 "status": "not_configured",
@@ -1061,8 +1140,11 @@ async fn run_validation_suite(
         }
     };
 
-    let overall_success =
-        validation_status(&build) != "failed" && validation_status(&test) != "failed";
+    let overall_success = matches!(validation_status(&build), "passed" | "not_configured")
+        && matches!(
+            validation_status(&test),
+            "passed" | "not_configured" | "skipped"
+        );
 
     Ok(ValidationResults {
         build,
@@ -1168,19 +1250,60 @@ fn build_command_spec(
     }))
 }
 
-async fn execute_validation_command(kind: &str, spec: CommandSpec, timeout_secs: u64) -> Value {
+async fn execute_validation_command(
+    kind: &str,
+    spec: CommandSpec,
+    timeout_secs: u64,
+    sandbox: &SandboxPolicy,
+) -> Value {
     let started_at = Utc::now();
     let started = Instant::now();
-    let mut command = Command::new(&spec.argv[0]);
-    command.args(&spec.argv[1..]).current_dir(&spec.working_dir);
-
-    let working_dir = spec.working_dir.to_string_lossy().to_string();
     let argv = spec.argv;
+    let original_working_dir = spec.working_dir.to_string_lossy().to_string();
+    let working_dir = match enforce_worktree_containment(
+        &sandbox.worktree_path,
+        &spec.working_dir,
+        "validation working directory",
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(error) => {
+            return sandbox_blocked_report(
+                kind,
+                &argv,
+                &original_working_dir,
+                started_at,
+                started.elapsed(),
+                error.to_string(),
+            );
+        }
+    };
+    let program = match resolve_validation_program(sandbox, &working_dir, &argv[0]).await {
+        Ok(path) => path,
+        Err(error) => {
+            return sandbox_blocked_report(
+                kind,
+                &argv,
+                &original_working_dir,
+                started_at,
+                started.elapsed(),
+                error.to_string(),
+            );
+        }
+    };
+    let mut command = Command::new(&program);
+    command.args(&argv[1..]).current_dir(&working_dir);
+    apply_sandbox_environment(&mut command, sandbox);
+
+    let working_dir = working_dir.to_string_lossy().to_string();
+    let resolved_program = program.to_string_lossy().to_string();
 
     match tokio::time::timeout(Duration::from_secs(timeout_secs), command.output()).await {
         Err(_) => json!({
             "status": "failed",
             "command": argv,
+            "resolved_program": resolved_program,
             "working_dir": working_dir,
             "started_at": started_at,
             "duration_ms": started.elapsed().as_millis() as u64,
@@ -1189,6 +1312,7 @@ async fn execute_validation_command(kind: &str, spec: CommandSpec, timeout_secs:
         Ok(Err(error)) => json!({
             "status": "failed",
             "command": argv,
+            "resolved_program": resolved_program,
             "working_dir": working_dir,
             "started_at": started_at,
             "duration_ms": started.elapsed().as_millis() as u64,
@@ -1197,6 +1321,7 @@ async fn execute_validation_command(kind: &str, spec: CommandSpec, timeout_secs:
         Ok(Ok(output)) => json!({
             "status": if output.status.success() { "passed" } else { "failed" },
             "command": argv,
+            "resolved_program": resolved_program,
             "working_dir": working_dir,
             "started_at": started_at,
             "duration_ms": started.elapsed().as_millis() as u64,
@@ -1229,6 +1354,190 @@ async fn ensure_repo_root(repo_root: &Path, repo_name: &str) -> anyhow::Result<(
     }
 
     Ok(())
+}
+
+async fn prepare_sandbox_policy(
+    config: &EdgeConfig,
+    worktree_path: &Path,
+) -> anyhow::Result<SandboxPolicy> {
+    let worktree_path =
+        enforce_worktree_containment(&config.worktree_root, worktree_path, "job worktree").await?;
+    let sandbox_root = worktree_path.join(".elowen-sandbox");
+    let temp_root = sandbox_root.join("tmp");
+    let cache_root = sandbox_root.join("cache");
+    let policy_path = sandbox_root.join("policy.json");
+
+    fs::create_dir_all(&temp_root)
+        .await
+        .with_context(|| format!("failed to create {}", temp_root.display()))?;
+    fs::create_dir_all(&cache_root)
+        .await
+        .with_context(|| format!("failed to create {}", cache_root.display()))?;
+
+    let policy = SandboxPolicy {
+        mode: config.sandbox_mode,
+        worktree_path,
+        sandbox_root,
+        temp_root,
+        cache_root,
+        policy_path,
+    };
+    let policy_body = serde_json::to_vec_pretty(&sandbox_report_value(&policy))
+        .context("failed to serialize sandbox policy")?;
+    fs::write(&policy.policy_path, policy_body)
+        .await
+        .with_context(|| format!("failed to write {}", policy.policy_path.display()))?;
+
+    Ok(policy)
+}
+
+fn sandbox_report_value(policy: &SandboxPolicy) -> Value {
+    json!({
+        "mode": policy.mode.as_str(),
+        "worktree_path": policy.worktree_path.to_string_lossy().to_string(),
+        "sandbox_root": policy.sandbox_root.to_string_lossy().to_string(),
+        "temp_root": policy.temp_root.to_string_lossy().to_string(),
+        "cache_root": policy.cache_root.to_string_lossy().to_string(),
+        "policy_path": policy.policy_path.to_string_lossy().to_string(),
+        "working_dir_must_stay_within_worktree": true,
+        "validation_shells_blocked": true,
+        "cache_redirects": [
+            "TMP",
+            "TEMP",
+            "TMPDIR",
+            "CARGO_TARGET_DIR",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CONFIG_HOME",
+            "npm_config_cache",
+            "PIP_CACHE_DIR",
+            "UV_CACHE_DIR"
+        ]
+    })
+}
+
+fn apply_sandbox_environment(command: &mut Command, policy: &SandboxPolicy) {
+    command
+        .env("TMP", &policy.temp_root)
+        .env("TEMP", &policy.temp_root)
+        .env("TMPDIR", &policy.temp_root)
+        .env("CARGO_TARGET_DIR", policy.sandbox_root.join("cargo-target"))
+        .env("XDG_CACHE_HOME", &policy.cache_root)
+        .env("XDG_STATE_HOME", policy.cache_root.join("state"))
+        .env("XDG_CONFIG_HOME", policy.cache_root.join("config"))
+        .env("npm_config_cache", policy.cache_root.join("npm"))
+        .env("PIP_CACHE_DIR", policy.cache_root.join("pip"))
+        .env("UV_CACHE_DIR", policy.cache_root.join("uv"))
+        .env("ELOWEN_SANDBOX_MODE", policy.mode.as_str())
+        .env("ELOWEN_SANDBOX_POLICY_FILE", &policy.policy_path)
+        .env("ELOWEN_SANDBOX_WORKTREE", &policy.worktree_path);
+}
+
+async fn enforce_worktree_containment(
+    worktree_root: &Path,
+    candidate: &Path,
+    label: &str,
+) -> anyhow::Result<PathBuf> {
+    let resolved_root = fs::canonicalize(worktree_root)
+        .await
+        .with_context(|| format!("failed to resolve sandbox root {}", worktree_root.display()))?;
+    let resolved_candidate = fs::canonicalize(candidate)
+        .await
+        .with_context(|| format!("failed to resolve {label} {}", candidate.display()))?;
+    if !resolved_candidate.starts_with(&resolved_root) {
+        return Err(sandbox_error(format!(
+            "{label} `{}` escapes sandbox root `{}`",
+            resolved_candidate.display(),
+            resolved_root.display()
+        )));
+    }
+
+    Ok(resolved_candidate)
+}
+
+async fn resolve_validation_program(
+    sandbox: &SandboxPolicy,
+    working_dir: &Path,
+    program: &str,
+) -> anyhow::Result<PathBuf> {
+    if is_disallowed_validation_program(program) {
+        return Err(sandbox_error(format!(
+            "validation command `{program}` is not allowed; invoke a direct executable instead of a shell"
+        )));
+    }
+
+    let program_path = Path::new(program);
+    if program_path.is_absolute() || program_path.components().count() > 1 {
+        let candidate = if program_path.is_absolute() {
+            program_path.to_path_buf()
+        } else {
+            working_dir.join(program_path)
+        };
+        return enforce_worktree_containment(
+            &sandbox.worktree_path,
+            &candidate,
+            "validation command path",
+        )
+        .await;
+    }
+
+    Ok(PathBuf::from(program))
+}
+
+fn is_disallowed_validation_program(program: &str) -> bool {
+    matches!(
+        validation_program_name(program).as_str(),
+        "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "powershell.exe"
+            | "pwsh"
+            | "pwsh.exe"
+            | "sh"
+            | "bash"
+            | "zsh"
+    )
+}
+
+fn validation_program_name(program: &str) -> String {
+    Path::new(program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(program)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn sandbox_blocked_report(
+    kind: &str,
+    argv: &[String],
+    working_dir: &str,
+    started_at: DateTime<Utc>,
+    duration: Duration,
+    reason: String,
+) -> Value {
+    json!({
+        "status": "sandbox_blocked",
+        "kind": kind,
+        "command": argv,
+        "working_dir": working_dir,
+        "started_at": started_at,
+        "duration_ms": duration.as_millis() as u64,
+        "reason": reason,
+    })
+}
+
+fn sandbox_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::anyhow!("{SANDBOX_ERROR_PREFIX}{}", message.into())
+}
+
+fn classify_failure(error: &anyhow::Error) -> (String, String) {
+    let detail = error.to_string();
+    if let Some(stripped) = detail.strip_prefix(SANDBOX_ERROR_PREFIX) {
+        ("sandbox".to_string(), stripped.to_string())
+    } else {
+        ("execution".to_string(), detail)
+    }
 }
 
 async fn publish_job_event(
@@ -1397,6 +1706,11 @@ async fn preflight_codex_runner(config: &EdgeConfig) -> anyhow::Result<()> {
     };
 
     validate_codex_args(&config.codex_args)?;
+    if is_disallowed_validation_program(command) {
+        return Err(sandbox_error(format!(
+            "configured Codex command `{command}` is not allowed; point ELOWEN_CODEX_COMMAND at the Codex binary directly"
+        )));
+    }
 
     let output = Command::new(command)
         .arg("--version")
@@ -1479,6 +1793,28 @@ fn validate_codex_args(args: &[String]) -> anyhow::Result<()> {
 
 fn is_redundant_codex_arg(arg: &str) -> bool {
     matches!(arg.trim(), "--json" | "--ephemeral")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SandboxMode, is_disallowed_validation_program, validation_program_name};
+
+    #[test]
+    fn sandbox_mode_defaults_to_workspace() {
+        assert_eq!(SandboxMode::from_env(None).unwrap(), SandboxMode::Workspace);
+    }
+
+    #[test]
+    fn shell_validation_commands_are_blocked() {
+        assert!(is_disallowed_validation_program("powershell"));
+        assert!(is_disallowed_validation_program("bash"));
+        assert!(!is_disallowed_validation_program("cargo"));
+    }
+
+    #[test]
+    fn validation_program_name_uses_file_name() {
+        assert_eq!(validation_program_name(r"C:\tools\cargo.exe"), "cargo.exe");
+    }
 }
 
 fn extract_codex_event_messages(stdout: &[u8]) -> Vec<String> {

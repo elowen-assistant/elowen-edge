@@ -42,6 +42,7 @@ Useful variables:
 - `ELOWEN_EDGE_WORKTREE_ROOT`
 - `ELOWEN_CODEX_COMMAND`
 - `ELOWEN_CODEX_ARGS_JSON`
+- `ELOWEN_SANDBOX_MODE`
 - `ELOWEN_LOG_FORMAT`
 - `RUST_LOG`
 
@@ -70,6 +71,18 @@ Optional extra CLI flags go in `ELOWEN_CODEX_ARGS_JSON`, for example:
 - it runs a startup preflight against the configured Codex CLI
 
 `ELOWEN_CODEX_ARGS_JSON` is for extra `codex exec` flags only. Do not include `exec`, `-C`, `--cd`, `-o`, or `--output-last-message` there.
+
+## Sandbox boundary
+
+`elowen-edge` now enforces a workspace sandbox by default:
+
+- validation working directories must stay inside the job worktree
+- validation commands cannot invoke shell entry points such as `powershell`, `pwsh`, `cmd`, `sh`, or `bash`
+- temp and cache writes are redirected into `.elowen-sandbox/` inside the worktree
+- each job writes a sandbox policy artifact to `.elowen-sandbox/policy.json`
+- sandbox-blocked runs surface as failure class `sandbox`
+
+Set `ELOWEN_SANDBOX_MODE=off` only for local debugging when you explicitly need to bypass those checks.
 
 ## Windows helper scripts
 
