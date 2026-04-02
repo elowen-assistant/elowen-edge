@@ -47,6 +47,30 @@ Useful variables:
 
 See [edge.env.example](D:/Projects/elowen/elowen-edge/edge.env.example) for a standalone laptop template.
 
+## Real Codex runner
+
+The supported real runner path is the Codex CLI:
+
+```powershell
+ELOWEN_CODEX_COMMAND=codex
+```
+
+Optional extra CLI flags go in `ELOWEN_CODEX_ARGS_JSON`, for example:
+
+```json
+["--model","gpt-5.4"]
+```
+
+`elowen-edge` manages the rest of the invocation itself:
+
+- it runs `codex exec`
+- it passes the job request file over stdin
+- it sets the worktree as the Codex working directory
+- it captures JSONL runner output and the final assistant message into worktree-local files
+- it runs a startup preflight against the configured Codex CLI
+
+`ELOWEN_CODEX_ARGS_JSON` is for extra `codex exec` flags only. Do not include `exec`, `-C`, `--cd`, `-o`, or `--output-last-message` there.
+
 ## Windows helper scripts
 
 The Windows helper scripts live under [scripts/windows](D:/Projects/elowen/elowen-edge/scripts/windows):

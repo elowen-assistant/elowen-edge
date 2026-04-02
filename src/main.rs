@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     env, fs as stdfs,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -184,6 +185,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
     let config = EdgeConfig::from_env(&env_overlay)?;
+    preflight_codex_runner(&config).await?;
     let http = HttpClient::builder()
         .build()
         .context("failed to build HTTP client")?;
@@ -702,7 +704,7 @@ async fn run_codex_wrapper(
     worktree_path: &Path,
 ) -> anyhow::Result<CommandOutcome> {
     if let Some(command) = &config.codex_command {
-        return run_external_codex_wrapper(dispatch, config, worktree_path, command).await;
+        return run_codex_cli(dispatch, config, worktree_path, command).await;
     }
 
     run_simulated_codex_wrapper(dispatch, config, worktree_path).await
@@ -750,14 +752,22 @@ async fn run_simulated_codex_wrapper(
     .await
 }
 
-async fn run_external_codex_wrapper(
+async fn run_codex_cli(
     dispatch: &JobDispatchMessage,
     config: &EdgeConfig,
     worktree_path: &Path,
     command: &str,
 ) -> anyhow::Result<CommandOutcome> {
-    let output = Command::new(command)
-        .args(&config.codex_args)
+    let prompt_path = worktree_path.join("elowen-job-request.md");
+    let prompt_body = fs::read_to_string(&prompt_path)
+        .await
+        .with_context(|| format!("failed to read {}", prompt_path.display()))?;
+    let output_path = worktree_path.join("elowen-runner-output.jsonl");
+    let error_path = worktree_path.join("elowen-runner-error.log");
+    let last_message_path = worktree_path.join("elowen-codex-last-message.txt");
+    let args = build_codex_exec_args(config, worktree_path, &last_message_path)?;
+    let mut child = Command::new(command)
+        .args(&args)
         .current_dir(worktree_path)
         .env("ELOWEN_JOB_ID", &dispatch.job_id)
         .env("ELOWEN_JOB_SHORT_ID", &dispatch.short_id)
@@ -768,35 +778,70 @@ async fn run_external_codex_wrapper(
         .env("ELOWEN_BASE_BRANCH", &dispatch.base_branch)
         .env("ELOWEN_WORKTREE_PATH", worktree_path)
         .env("ELOWEN_REQUEST_TEXT", &dispatch.request_text)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start Codex CLI `{command}`"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to open stdin for Codex CLI process")?;
+    stdin
+        .write_all(prompt_body.as_bytes())
         .await
-        .with_context(|| format!("failed to run Codex wrapper command `{command}`"))?;
+        .context("failed to send prompt to Codex CLI")?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .with_context(|| format!("failed while waiting for Codex CLI `{command}`"))?;
+
+    fs::write(&output_path, &output.stdout)
+        .await
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    fs::write(&error_path, &output.stderr)
+        .await
+        .with_context(|| format!("failed to write {}", error_path.display()))?;
 
     let stdout = truncate_text(&String::from_utf8_lossy(&output.stdout), 4000);
     let stderr = truncate_text(&String::from_utf8_lossy(&output.stderr), 4000);
-    let log_path = worktree_path.join("elowen-runner-output.log");
-    let log_body = format!("stdout:\n{}\n\nstderr:\n{}\n", stdout, stderr);
-    fs::write(&log_path, log_body)
+    let last_message = fs::read_to_string(&last_message_path)
         .await
-        .with_context(|| format!("failed to write {}", log_path.display()))?;
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let event_messages = extract_codex_event_messages(&output.stdout);
 
     if !output.status.success() {
-        anyhow::bail!("Codex wrapper command failed with status {}", output.status);
+        anyhow::bail!(
+            "Codex CLI failed with status {}. See {} and {}",
+            output.status,
+            output_path.display(),
+            error_path.display()
+        );
     }
 
     finalize_command_outcome(
         dispatch,
         config,
         worktree_path,
-        "external",
+        "codex-cli",
         json!({
             "command": command,
-            "args": config.codex_args.clone(),
+            "args": args,
+            "prompt_path": prompt_path.to_string_lossy().to_string(),
+            "output_path": output_path.to_string_lossy().to_string(),
+            "error_path": error_path.to_string_lossy().to_string(),
+            "last_message_path": last_message_path.to_string_lossy().to_string(),
+            "last_message": last_message,
+            "event_messages": event_messages,
             "stdout": stdout,
             "stderr": stderr,
-            "log_path": log_path.to_string_lossy().to_string(),
         }),
-        format!("external Codex wrapper `{command}` completed successfully"),
+        format!("Codex CLI `{command}` completed successfully"),
     )
     .await
 }
@@ -1344,6 +1389,113 @@ fn env_value(key: &str, env_overlay: &EnvOverlay) -> Option<String> {
         .or_else(|| env::var(key).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+async fn preflight_codex_runner(config: &EdgeConfig) -> anyhow::Result<()> {
+    let Some(command) = config.codex_command.as_deref() else {
+        return Ok(());
+    };
+
+    validate_codex_args(&config.codex_args)?;
+
+    let output = Command::new(command)
+        .arg("--version")
+        .output()
+        .await
+        .with_context(|| format!("failed to start configured Codex CLI `{command}`"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "configured Codex CLI `{command}` failed preflight with status {}",
+            output.status
+        );
+    }
+
+    let version = truncate_text(&String::from_utf8_lossy(&output.stdout), 200);
+    info!(command = %command, version = %version, "Codex CLI preflight succeeded");
+    Ok(())
+}
+
+fn build_codex_exec_args(
+    config: &EdgeConfig,
+    worktree_path: &Path,
+    last_message_path: &Path,
+) -> anyhow::Result<Vec<String>> {
+    validate_codex_args(&config.codex_args)?;
+
+    let mut args = vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--ephemeral".to_string(),
+        "-C".to_string(),
+        worktree_path.to_string_lossy().to_string(),
+        "-o".to_string(),
+        last_message_path.to_string_lossy().to_string(),
+    ];
+    args.extend(
+        config
+            .codex_args
+            .iter()
+            .filter(|arg| !is_redundant_codex_arg(arg))
+            .cloned(),
+    );
+    args.push("-".to_string());
+    Ok(args)
+}
+
+fn validate_codex_args(args: &[String]) -> anyhow::Result<()> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let normalized = arg.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+
+        if matches!(normalized, "exec" | "e" | "-" | "review" | "resume") {
+            anyhow::bail!(
+                "ELOWEN_CODEX_ARGS_JSON should contain extra Codex exec flags only; remove `{normalized}`"
+            );
+        }
+
+        if matches!(normalized, "-C" | "--cd" | "-o" | "--output-last-message") {
+            anyhow::bail!(
+                "ELOWEN_CODEX_ARGS_JSON must not include `{normalized}` because elowen-edge manages the working directory and output paths"
+            );
+        }
+
+        if normalized.starts_with("--cd=") || normalized.starts_with("--output-last-message=") {
+            anyhow::bail!(
+                "ELOWEN_CODEX_ARGS_JSON must not override Codex working directory or output file paths"
+            );
+        }
+
+        if matches!(normalized, "-C" | "--cd" | "-o" | "--output-last-message") {
+            let _ = iter.next();
+        }
+    }
+
+    Ok(())
+}
+
+fn is_redundant_codex_arg(arg: &str) -> bool {
+    matches!(arg.trim(), "--json" | "--ephemeral")
+}
+
+fn extract_codex_event_messages(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|event| {
+            let item = event.get("item")?;
+            if item.get("type")?.as_str()? != "agent_message" {
+                return None;
+            }
+
+            item.get("text")?
+                .as_str()
+                .map(|text| truncate_text(text, 1000))
+        })
+        .collect()
 }
 
 fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> String {
