@@ -1347,8 +1347,8 @@ async fn capture_git_report(worktree_path: &Path) -> anyhow::Result<GitReport> {
 
     let status_lines = String::from_utf8_lossy(&status_output.stdout)
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
         .filter(|line| {
             let path = normalize_git_status_path(line);
             !is_runtime_artifact_path(path)
