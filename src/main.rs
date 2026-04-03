@@ -117,6 +117,14 @@ struct CommandOutcome {
     approval_summary: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct CommitRecord {
+    sha: String,
+    short_sha: String,
+    message: String,
+    changed_files: Vec<String>,
+}
+
 struct GitReport {
     status_lines: Vec<String>,
     diff_stat: Option<String>,
@@ -731,6 +739,7 @@ async fn run_job_execution(
             payload_json: Some(json!({
                 "summary_markdown": command_outcome.summary_markdown,
                 "execution_report": command_outcome.execution_report,
+                "push_required": command_outcome.approval_summary.is_some(),
             })),
             created_at: Utc::now(),
         },
@@ -1150,7 +1159,6 @@ async fn finalize_command_outcome(
     base_detail: String,
 ) -> anyhow::Result<CommandOutcome> {
     let validation = run_validation_suite(config, &sandbox.worktree_path, sandbox).await?;
-    let git_report = capture_git_report(&sandbox.worktree_path).await?;
     let build_status = validation_status(&validation.build);
     let test_status = validation_status(&validation.test);
     let sandbox_blocked =
@@ -1168,7 +1176,7 @@ async fn finalize_command_outcome(
         Some("validation".to_string())
     };
     let detail = if validation.overall_success {
-        base_detail
+        base_detail.clone()
     } else if sandbox_blocked {
         format!(
             "sandbox blocked post-execution validation (build: {build_status}, test: {test_status})"
@@ -1177,6 +1185,14 @@ async fn finalize_command_outcome(
         format!(
             "validation failed after Codex execution (build: {build_status}, test: {test_status})"
         )
+    };
+    let mut git_report = capture_git_report(&sandbox.worktree_path).await?;
+    let commit = if validation.overall_success {
+        let commit = maybe_create_job_commit(&sandbox.worktree_path, dispatch, &git_report).await?;
+        git_report = capture_git_report(&sandbox.worktree_path).await?;
+        commit
+    } else {
+        None
     };
 
     let mut execution_report = serde_json::Map::new();
@@ -1195,8 +1211,22 @@ async fn finalize_command_outcome(
     execution_report.insert("git_status".to_string(), json!(git_report.status_lines));
     execution_report.insert("diff_stat".to_string(), json!(git_report.diff_stat));
     execution_report.insert("changed_files".to_string(), json!(git_report.changed_files));
+    execution_report.insert("commit".to_string(), json!(commit));
     execution_report.insert("sandbox".to_string(), sandbox_report_value(sandbox));
     let execution_report = Value::Object(execution_report);
+
+    let detail = if validation.overall_success {
+        if let Some(commit) = commit.as_ref() {
+            format!(
+                "{base_detail}; created commit {} for branch {}",
+                commit.short_sha, dispatch.branch_name
+            )
+        } else {
+            format!("{base_detail}; no committed repo changes were detected")
+        }
+    } else {
+        detail
+    };
 
     let summary_markdown = format!(
         "# Job Summary\n\n\
@@ -1209,6 +1239,8 @@ async fn finalize_command_outcome(
         ## Validation\n\n\
         - Build: {build_status}\n\
         - Test: {test_status}\n\n\
+        ## Commit\n\n\
+        - Commit: {commit_line}\n\n\
         ## Workspace Changes\n\n\
         - Changed entries: {}\n\
         - Diff stat: {}\n",
@@ -1221,12 +1253,17 @@ async fn finalize_command_outcome(
             .diff_stat
             .clone()
             .unwrap_or_else(|| "no tracked diff".to_string()),
+        commit_line = commit
+            .as_ref()
+            .map(|commit| format!("`{}` ({})", commit.short_sha, commit.message))
+            .unwrap_or_else(|| "none".to_string()),
     );
-    let approval_summary = validation.overall_success.then(|| {
+    let approval_summary = commit.as_ref().map(|commit| {
         format!(
-            "Approve push for `{}` on branch `{}` after reviewing the generated summary, validation output, and {} changed entries.",
+            "Approve push for `{}` on branch `{}` with commit `{}` after reviewing the generated summary, validation output, and {} changed entries.",
             dispatch.repo_name,
             dispatch.branch_name,
+            commit.short_sha,
             git_report.changed_files.len(),
         )
     });
@@ -1312,11 +1349,15 @@ async fn capture_git_report(worktree_path: &Path) -> anyhow::Result<GitReport> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let path = normalize_git_status_path(line);
+            !is_runtime_artifact_path(path)
+        })
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     let changed_files = status_lines
         .iter()
-        .map(|line| line.get(3..).unwrap_or(line.as_str()).trim().to_string())
+        .map(|line| normalize_git_status_path(line).to_string())
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     let diff_stat = String::from_utf8_lossy(&diff_stat_output.stdout)
@@ -1331,6 +1372,96 @@ async fn capture_git_report(worktree_path: &Path) -> anyhow::Result<GitReport> {
         diff_stat: (!diff_stat.is_empty()).then_some(diff_stat),
         changed_files,
     })
+}
+
+async fn maybe_create_job_commit(
+    worktree_path: &Path,
+    dispatch: &JobDispatchMessage,
+    git_report: &GitReport,
+) -> anyhow::Result<Option<CommitRecord>> {
+    if git_report.changed_files.is_empty() {
+        return Ok(None);
+    }
+
+    let mut add = Command::new("git");
+    add.arg("-C").arg(worktree_path).arg("add").arg("--");
+    for path in &git_report.changed_files {
+        add.arg(path);
+    }
+    let add_output = add
+        .output()
+        .await
+        .context("failed to stage job changes before commit")?;
+    if !add_output.status.success() {
+        anyhow::bail!(
+            "git add failed before job commit: {}",
+            summarize_command_output(&add_output.stdout, &add_output.stderr)
+        );
+    }
+
+    let staged_output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .await
+        .context("failed to inspect staged job changes")?;
+    let staged_files = String::from_utf8_lossy(&staged_output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if staged_files.is_empty() {
+        return Ok(None);
+    }
+
+    let message = build_job_commit_message(dispatch);
+    let commit_output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["commit", "-m"])
+        .arg(&message)
+        .output()
+        .await
+        .context("failed to create job commit")?;
+    if !commit_output.status.success() {
+        anyhow::bail!(
+            "git commit failed for job `{}`: {}",
+            dispatch.short_id,
+            summarize_command_output(&commit_output.stdout, &commit_output.stderr)
+        );
+    }
+
+    let rev_output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .context("failed to read committed job revision")?;
+    if !rev_output.status.success() {
+        anyhow::bail!(
+            "git rev-parse failed after job commit: {}",
+            summarize_command_output(&rev_output.stdout, &rev_output.stderr)
+        );
+    }
+    let sha = String::from_utf8_lossy(&rev_output.stdout)
+        .trim()
+        .to_string();
+    let short_sha = sha.chars().take(8).collect::<String>();
+
+    Ok(Some(CommitRecord {
+        sha,
+        short_sha,
+        message,
+        changed_files: staged_files,
+    }))
+}
+
+fn build_job_commit_message(dispatch: &JobDispatchMessage) -> String {
+    let title = truncate_text(dispatch.title.trim(), 48);
+    format!("Elowen job {}: {}", dispatch.short_id, title)
 }
 
 async fn run_validation_suite(
@@ -1947,6 +2078,25 @@ fn classify_push_failure(error: &anyhow::Error) -> (String, String) {
     } else {
         ("execution".to_string(), detail)
     }
+}
+
+fn normalize_git_status_path(line: &str) -> &str {
+    let path = line.get(3..).unwrap_or(line).trim();
+    path.rsplit_once("->")
+        .map(|(_, new_path)| new_path.trim())
+        .unwrap_or(path)
+}
+
+fn is_runtime_artifact_path(path: &str) -> bool {
+    matches!(
+        path,
+        ".elowen-job.json"
+            | "elowen-codex-last-message.txt"
+            | "elowen-job-request.md"
+            | "elowen-job-summary.md"
+            | "elowen-runner-error.log"
+            | "elowen-runner-output.jsonl"
+    ) || path.starts_with(".elowen-sandbox")
 }
 
 fn env_value(key: &str, env_overlay: &EnvOverlay) -> Option<String> {
