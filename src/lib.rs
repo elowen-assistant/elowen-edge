@@ -21,8 +21,8 @@ use tracing::{info, warn};
 
 use config::{EdgeConfig, EnvOverlay, env_value, load_env_overlay, parse_startup_options};
 use contracts::{
-    AvailabilityProbeMessage, AvailabilitySnapshot, JobApprovalCommand, JobDispatchMessage,
-    JobLifecycleEvent, RegisterDeviceRequest,
+    AvailabilityProbeMessage, AvailabilitySnapshot, ExecutionIntent, JobApprovalCommand,
+    JobDispatchMessage, JobLifecycleEvent, RegisterDeviceRequest,
 };
 
 struct CommandOutcome {
@@ -1047,7 +1047,9 @@ async fn finalize_command_outcome(
         )
     };
     let mut git_report = capture_git_report(&sandbox.worktree_path).await?;
-    let commit = if validation.overall_success {
+    let commit = if validation.overall_success
+        && !matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly)
+    {
         let commit = maybe_create_job_commit(&sandbox.worktree_path, dispatch, &git_report).await?;
         git_report = capture_git_report(&sandbox.worktree_path).await?;
         commit
@@ -1072,11 +1074,31 @@ async fn finalize_command_outcome(
     execution_report.insert("diff_stat".to_string(), json!(git_report.diff_stat));
     execution_report.insert("changed_files".to_string(), json!(git_report.changed_files));
     execution_report.insert("commit".to_string(), json!(commit));
+    execution_report.insert(
+        "execution_intent".to_string(),
+        json!(dispatch.execution_intent),
+    );
+    execution_report.insert(
+        "read_only_change_detected".to_string(),
+        json!(
+            matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly)
+                && !git_report.changed_files.is_empty()
+        ),
+    );
     execution_report.insert("sandbox".to_string(), sandbox_report_value(sandbox));
     let execution_report = Value::Object(execution_report);
 
     let detail = if validation.overall_success {
-        if let Some(commit) = commit.as_ref() {
+        if matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly)
+            && !git_report.changed_files.is_empty()
+        {
+            format!(
+                "{base_detail}; read-only mode left {} changed entries uncommitted in the disposable worktree",
+                git_report.changed_files.len()
+            )
+        } else if matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly) {
+            format!("{base_detail}; read-only mode produced no tracked repo changes")
+        } else if let Some(commit) = commit.as_ref() {
             format!(
                 "{base_detail}; created commit {} for branch {}",
                 commit.short_sha, dispatch.branch_name
@@ -1094,6 +1116,7 @@ async fn finalize_command_outcome(
         - Runner: {runner}\n\
         - Repo: {}\n\
         - Branch: {}\n\
+        - Execution intent: {}\n\
         - Validation config: {}\n\n\
         ## Request\n\n{}\n\n\
         ## Validation\n\n\
@@ -1106,6 +1129,7 @@ async fn finalize_command_outcome(
         - Diff stat: {}\n",
         dispatch.repo_name,
         dispatch.branch_name,
+        dispatch.execution_intent.as_str(),
         validation.config_source,
         dispatch.request_text,
         git_report.changed_files.len(),
@@ -1118,7 +1142,10 @@ async fn finalize_command_outcome(
             .map(|commit| format!("`{}` ({})", commit.short_sha, commit.message))
             .unwrap_or_else(|| "none".to_string()),
     );
-    let approval_summary = commit.as_ref().map(|commit| {
+    let approval_summary = if matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly) {
+        None
+    } else {
+        commit.as_ref().map(|commit| {
         format!(
             "Approve push for `{}` on branch `{}` with commit `{}` after reviewing the generated summary, validation output, and {} changed entries.",
             dispatch.repo_name,
@@ -1126,7 +1153,8 @@ async fn finalize_command_outcome(
             commit.short_sha,
             git_report.changed_files.len(),
         )
-    });
+        })
+    };
 
     Ok(CommandOutcome {
         detail,
@@ -1144,6 +1172,7 @@ async fn write_job_request_files(
 ) -> anyhow::Result<()> {
     let prompt_path = worktree_path.join("elowen-job-request.md");
     let metadata_path = worktree_path.join(".elowen-job.json");
+    let intent_guidance = execution_intent_guidance(&dispatch.execution_intent);
 
     fs::write(
         &prompt_path,
@@ -1154,14 +1183,16 @@ async fn write_job_request_files(
             - Repo: {}\n\
             - Branch: {}\n\
             - Base branch: {}\n\n\
+            - Execution intent: {}\n\n\
             ## Requested Work\n\n{}\n",
             dispatch.job_id,
             dispatch.thread_id,
             dispatch.repo_name,
             dispatch.branch_name,
             dispatch.base_branch,
+            dispatch.execution_intent.as_str(),
             dispatch.request_text
-        ),
+        ) + &format!("\n## Execution Guidance\n\n{}\n", intent_guidance),
     )
     .await
     .with_context(|| format!("failed to write {}", prompt_path.display()))?;
@@ -1174,6 +1205,7 @@ async fn write_job_request_files(
         "repo_name": dispatch.repo_name,
         "base_branch": dispatch.base_branch,
         "branch_name": dispatch.branch_name,
+        "execution_intent": dispatch.execution_intent,
         "request_text": dispatch.request_text,
         "dispatched_at": dispatch.dispatched_at,
     }))
@@ -1187,6 +1219,17 @@ async fn write_job_request_files(
         .with_context(|| format!("failed to write {}", metadata_path.display()))?;
 
     Ok(())
+}
+
+fn execution_intent_guidance(intent: &ExecutionIntent) -> &'static str {
+    match intent {
+        ExecutionIntent::WorkspaceChange => {
+            "Make the requested repository changes, summarize what changed, and leave the worktree ready for commit and approval if durable changes are needed."
+        }
+        ExecutionIntent::ReadOnly => {
+            "Inspect and report only. Do not create durable repository changes, do not create commits, and do not ask for push approval. If a tool leaves tracked changes behind, leave them uncommitted in the disposable worktree and call that out in the result."
+        }
+    }
 }
 
 async fn capture_git_report(worktree_path: &Path) -> anyhow::Result<GitReport> {
@@ -1975,7 +2018,11 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxMode, is_disallowed_validation_program, validation_program_name};
+    use super::{
+        SandboxMode, execution_intent_guidance, is_disallowed_validation_program,
+        validation_program_name,
+    };
+    use crate::contracts::ExecutionIntent;
 
     #[test]
     fn sandbox_mode_defaults_to_workspace() {
@@ -1992,5 +2039,12 @@ mod tests {
     #[test]
     fn validation_program_name_uses_file_name() {
         assert_eq!(validation_program_name(r"C:\tools\cargo.exe"), "cargo.exe");
+    }
+
+    #[test]
+    fn read_only_guidance_mentions_no_commit_or_push() {
+        let guidance = execution_intent_guidance(&ExecutionIntent::ReadOnly);
+        assert!(guidance.contains("do not create commits"));
+        assert!(guidance.contains("do not ask for push approval"));
     }
 }

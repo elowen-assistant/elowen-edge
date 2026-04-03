@@ -6,6 +6,24 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Requested execution intent for a dispatched job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionIntent {
+    WorkspaceChange,
+    ReadOnly,
+}
+
+impl ExecutionIntent {
+    /// Returns the stable wire label used in prompts, summaries, and reports.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::WorkspaceChange => "workspace_change",
+            Self::ReadOnly => "read_only",
+        }
+    }
+}
+
 /// Device registration payload sent to the orchestrator API.
 #[derive(Debug, Serialize)]
 pub(crate) struct RegisterDeviceRequest {
@@ -28,6 +46,7 @@ pub(crate) struct JobDispatchMessage {
     pub(crate) base_branch: String,
     pub(crate) branch_name: String,
     pub(crate) request_text: String,
+    pub(crate) execution_intent: ExecutionIntent,
     pub(crate) dispatched_at: DateTime<Utc>,
 }
 
