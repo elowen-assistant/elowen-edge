@@ -77,6 +77,19 @@ struct JobLifecycleEvent {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobApprovalCommand {
+    approval_id: String,
+    job_id: String,
+    short_id: String,
+    correlation_id: String,
+    device_id: String,
+    repo_name: String,
+    branch_name: String,
+    action_type: String,
+    approved_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct AvailabilityProbeMessage {
     probe_id: String,
@@ -247,9 +260,15 @@ async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
         .subscribe(dispatch_subject.clone())
         .await
         .context("failed to subscribe to job dispatch")?;
+    let approval_subject = format!("elowen.jobs.approvals.{}", config.device_id);
+    let mut approval_subscription = nats
+        .subscribe(approval_subject.clone())
+        .await
+        .context("failed to subscribe to approval commands")?;
 
     info!(subject = %subject, "awaiting availability probes");
     info!(subject = %dispatch_subject, "awaiting job dispatches");
+    info!(subject = %approval_subject, "awaiting approval commands");
 
     let dispatch_config = config.clone();
     let dispatch_nats = nats.clone();
@@ -298,6 +317,50 @@ async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
                     error = %error,
                     "job dispatch handler failed"
                 );
+            }
+        }
+    });
+
+    let approval_config = config.clone();
+    let approval_nats = nats.clone();
+    let approval_active_job_id = active_job_id.clone();
+    tokio::spawn(async move {
+        while let Some(message) = approval_subscription.next().await {
+            let command: JobApprovalCommand = match serde_json::from_slice(&message.payload) {
+                Ok(command) => command,
+                Err(error) => {
+                    warn!(error = %error, "failed to decode approval command");
+                    continue;
+                }
+            };
+
+            if command.device_id != approval_config.device_id {
+                warn!(
+                    expected_device_id = %approval_config.device_id,
+                    received_device_id = %command.device_id,
+                    "ignoring mismatched approval command"
+                );
+                continue;
+            }
+
+            info!(
+                job_id = %command.job_id,
+                correlation_id = %command.correlation_id,
+                approval_id = %command.approval_id,
+                repo_name = %command.repo_name,
+                branch_name = %command.branch_name,
+                "received approval command"
+            );
+
+            if let Err(error) = handle_job_approval(
+                command,
+                approval_config.clone(),
+                approval_nats.clone(),
+                approval_active_job_id.clone(),
+            )
+            .await
+            {
+                warn!(error = %error, "job approval handler failed");
             }
         }
     });
@@ -696,6 +759,175 @@ async fn run_job_execution(
         )
         .await?;
     }
+
+    Ok(())
+}
+
+async fn handle_job_approval(
+    command: JobApprovalCommand,
+    config: EdgeConfig,
+    nats: async_nats::Client,
+    active_job_id: Arc<Mutex<Option<String>>>,
+) -> anyhow::Result<()> {
+    wait_for_idle_slot(&active_job_id, &command.job_id).await;
+    let push_result = run_approved_push(&command, &config, &nats).await;
+
+    {
+        let mut guard = active_job_id.lock().await;
+        if guard.as_deref() == Some(command.job_id.as_str()) {
+            *guard = None;
+        }
+    }
+
+    if let Err(error) = push_result {
+        let (failure_class, detail) = classify_push_failure(&error);
+        publish_job_event(
+            &nats,
+            JobLifecycleEvent {
+                job_id: command.job_id.clone(),
+                correlation_id: command.correlation_id.clone(),
+                device_id: config.device_id.clone(),
+                event_type: "job.failed".to_string(),
+                status: Some("failed".to_string()),
+                result: Some("failure".to_string()),
+                failure_class: Some(failure_class),
+                worktree_path: None,
+                detail: Some(detail),
+                payload_json: Some(json!({
+                    "approval_id": command.approval_id,
+                    "action_type": command.action_type,
+                    "branch_name": command.branch_name,
+                })),
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn wait_for_idle_slot(active_job_id: &Arc<Mutex<Option<String>>>, next_job_id: &str) {
+    loop {
+        let claimed = {
+            let mut guard = active_job_id.lock().await;
+            match guard.as_deref() {
+                None => {
+                    *guard = Some(next_job_id.to_string());
+                    true
+                }
+                Some(current_job_id) if current_job_id == next_job_id => true,
+                _ => false,
+            }
+        };
+
+        if claimed {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn run_approved_push(
+    command: &JobApprovalCommand,
+    config: &EdgeConfig,
+    nats: &async_nats::Client,
+) -> anyhow::Result<()> {
+    let worktree_path = config
+        .worktree_root
+        .join(&command.repo_name)
+        .join(&command.short_id);
+    let worktree_path = enforce_worktree_containment(
+        &config.worktree_root,
+        &worktree_path,
+        "approved push worktree",
+    )
+    .await?;
+
+    fs::metadata(&worktree_path).await.with_context(|| {
+        format!(
+            "approved push worktree is missing at {}",
+            worktree_path.display()
+        )
+    })?;
+
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    publish_job_event(
+        nats,
+        JobLifecycleEvent {
+            job_id: command.job_id.clone(),
+            correlation_id: command.correlation_id.clone(),
+            device_id: config.device_id.clone(),
+            event_type: "job.push_started".to_string(),
+            status: Some("pushing".to_string()),
+            result: Some("success".to_string()),
+            failure_class: None,
+            worktree_path: Some(worktree_path_str.clone()),
+            detail: Some("approved push started on edge".to_string()),
+            payload_json: Some(json!({
+                "approval_id": command.approval_id,
+                "action_type": command.action_type,
+                "branch_name": command.branch_name,
+                "remote": "origin",
+            })),
+            created_at: Utc::now(),
+        },
+    )
+    .await?;
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&worktree_path)
+        .args(["push", "-u", "origin"])
+        .arg(&command.branch_name)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to execute approved push for branch {}",
+                command.branch_name
+            )
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git push failed for `{}`: {}",
+            command.branch_name,
+            summarize_process_output(&stdout, &stderr)
+        );
+    }
+
+    publish_job_event(
+        nats,
+        JobLifecycleEvent {
+            job_id: command.job_id.clone(),
+            correlation_id: command.correlation_id.clone(),
+            device_id: config.device_id.clone(),
+            event_type: "job.push_completed".to_string(),
+            status: Some("completed".to_string()),
+            result: Some("success".to_string()),
+            failure_class: None,
+            worktree_path: Some(worktree_path_str),
+            detail: Some(format!(
+                "pushed branch `{}` to `origin`",
+                command.branch_name
+            )),
+            payload_json: Some(json!({
+                "approval_id": command.approval_id,
+                "action_type": command.action_type,
+                "branch_name": command.branch_name,
+                "remote": "origin",
+                "stdout": truncate_text(&stdout, 800),
+                "stderr": truncate_text(&stderr, 800),
+            })),
+            created_at: Utc::now(),
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -1689,6 +1921,32 @@ fn parse_env_file_value(raw_value: &str) -> String {
     }
 
     raw_value.to_string()
+}
+
+fn summarize_process_output(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+
+    if !stderr.is_empty() {
+        truncate_text(stderr, 240)
+    } else if !stdout.is_empty() {
+        truncate_text(stdout, 240)
+    } else {
+        "process exited without output".to_string()
+    }
+}
+
+fn classify_push_failure(error: &anyhow::Error) -> (String, String) {
+    let detail = error.to_string();
+    if detail.contains("worktree")
+        || detail.contains("sandbox")
+        || detail.contains("missing")
+        || detail.contains("containment")
+    {
+        ("infrastructure".to_string(), detail)
+    } else {
+        ("execution".to_string(), detail)
+    }
 }
 
 fn env_value(key: &str, env_overlay: &EnvOverlay) -> Option<String> {
