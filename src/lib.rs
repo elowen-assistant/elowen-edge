@@ -439,8 +439,6 @@ fn discover_repositories_from_root(
                 discovered.push(trimmed.to_string());
             }
         }
-
-        return Ok(());
     }
 
     for entry in stdfs::read_dir(directory)
@@ -466,6 +464,65 @@ fn discover_repositories_from_root(
     }
 
     Ok(())
+}
+
+fn resolve_repo_root(config: &EdgeConfig, repo_name: &str) -> anyhow::Result<PathBuf> {
+    let mut search_roots = vec![config.workspace_root.clone()];
+    for root in &config.allowed_repo_roots {
+        if search_roots.iter().any(|existing| existing == root) {
+            continue;
+        }
+
+        search_roots.push(root.clone());
+    }
+
+    for root in search_roots {
+        if let Some(repo_root) = find_repo_root_in_directory(&root, repo_name)? {
+            return Ok(repo_root);
+        }
+    }
+
+    anyhow::bail!("workspace repository `{repo_name}` was not found")
+}
+
+fn find_repo_root_in_directory(
+    directory: &Path,
+    repo_name: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    if contains_git_dir(directory)?
+        && directory
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.trim() == repo_name)
+    {
+        return Ok(Some(directory.to_path_buf()));
+    }
+
+    for entry in stdfs::read_dir(directory)
+        .with_context(|| format!("failed to read repository root {}", directory.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to inspect {}", directory.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type for {}", entry.path().display()))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if should_skip_repo_scan_directory(name) {
+            continue;
+        }
+
+        if let Some(repo_root) = find_repo_root_in_directory(&path, repo_name)? {
+            return Ok(Some(repo_root));
+        }
+    }
+
+    Ok(None)
 }
 
 fn contains_git_dir(directory: &Path) -> anyhow::Result<bool> {
@@ -885,7 +942,7 @@ async fn create_worktree(
     dispatch: &JobDispatchMessage,
     config: &EdgeConfig,
 ) -> anyhow::Result<PathBuf> {
-    let repo_root = config.workspace_root.join(&dispatch.repo_name);
+    let repo_root = resolve_repo_root(config, &dispatch.repo_name)?;
     ensure_repo_root(&repo_root, &dispatch.repo_name).await?;
 
     let worktree_parent = config.worktree_root.join(&dispatch.repo_name);
@@ -2100,7 +2157,7 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         SandboxMode, contains_git_dir, discover_repositories, execution_intent_guidance,
-        is_disallowed_validation_program, validation_program_name,
+        find_repo_root_in_directory, is_disallowed_validation_program, validation_program_name,
     };
     use crate::contracts::ExecutionIntent;
     use std::{fs, path::PathBuf};
@@ -2140,15 +2197,21 @@ mod tests {
     #[test]
     fn discovery_collects_repo_names_from_parent_root() {
         let root = unique_temp_dir("repo-discovery");
-        let api_repo = root.join("elowen-api");
+        let workspace_repo = root.join("elowen");
+        let api_repo = workspace_repo.join("elowen-api");
         let ui_repo = root.join("elowen-ui");
+        fs::create_dir_all(workspace_repo.join(".git")).unwrap();
         fs::create_dir_all(api_repo.join(".git")).unwrap();
         fs::create_dir_all(ui_repo.join(".git")).unwrap();
 
         let repos = discover_repositories(&[root.clone()]).unwrap();
         assert_eq!(
             repos,
-            vec!["elowen-api".to_string(), "elowen-ui".to_string()]
+            vec![
+                "elowen".to_string(),
+                "elowen-api".to_string(),
+                "elowen-ui".to_string()
+            ]
         );
 
         let _ = fs::remove_dir_all(root);
@@ -2160,6 +2223,20 @@ mod tests {
         fs::write(root.join(".git"), "gitdir: ../.git/worktrees/example").unwrap();
 
         assert!(contains_git_dir(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repo_root_lookup_finds_nested_repo_inside_git_workspace() {
+        let root = unique_temp_dir("repo-lookup");
+        let workspace_repo = root.join("elowen");
+        let api_repo = workspace_repo.join("elowen-api");
+        fs::create_dir_all(workspace_repo.join(".git")).unwrap();
+        fs::create_dir_all(api_repo.join(".git")).unwrap();
+
+        let resolved = find_repo_root_in_directory(&root, "elowen-api").unwrap();
+        assert_eq!(resolved, Some(api_repo.clone()));
 
         let _ = fs::remove_dir_all(root);
     }
