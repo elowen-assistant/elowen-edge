@@ -26,6 +26,7 @@ pub(crate) struct EdgeConfig {
     pub(crate) device_name: String,
     pub(crate) primary_flag: bool,
     pub(crate) allowed_repos: Vec<String>,
+    pub(crate) allowed_repo_roots: Vec<PathBuf>,
     pub(crate) capabilities: Vec<String>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) worktree_root: PathBuf,
@@ -49,6 +50,8 @@ impl EdgeConfig {
         let worktree_root = env_value("ELOWEN_EDGE_WORKTREE_ROOT", env_overlay)
             .map(PathBuf::from)
             .unwrap_or_else(|| workspace_root.join(".elowen").join("worktrees"));
+        let allowed_repo_roots =
+            parse_repo_root_env("ELOWEN_ALLOWED_REPO_ROOTS", &workspace_root, env_overlay)?;
 
         Ok(Self {
             api_url: env_value("ELOWEN_API_URL", env_overlay)
@@ -62,8 +65,7 @@ impl EdgeConfig {
             primary_flag: env_value("ELOWEN_DEVICE_PRIMARY", env_overlay)
                 .map(|value| parse_bool(&value))
                 .unwrap_or(true),
-            allowed_repos: parse_list_env(
-                "ELOWEN_ALLOWED_REPOS",
+            allowed_repos: parse_allowed_repos_env(
                 &[
                     "elowen-api",
                     "elowen-ui",
@@ -71,8 +73,10 @@ impl EdgeConfig {
                     "elowen-notes",
                     "elowen-platform",
                 ],
+                &allowed_repo_roots,
                 env_overlay,
             ),
+            allowed_repo_roots,
             capabilities: parse_list_env(
                 "ELOWEN_DEVICE_CAPABILITIES",
                 &["codex", "git", "build", "test"],
@@ -175,6 +179,35 @@ pub(crate) fn env_value(key: &str, env_overlay: &EnvOverlay) -> Option<String> {
 
 fn parse_list_env(key: &str, default: &[&str], env_overlay: &EnvOverlay) -> Vec<String> {
     let value = env_value(key, env_overlay).unwrap_or_else(|| default.join(","));
+    parse_list_value(&value)
+}
+
+fn parse_allowed_repos_env(
+    default: &[&str],
+    allowed_repo_roots: &[PathBuf],
+    env_overlay: &EnvOverlay,
+) -> Vec<String> {
+    if let Some(value) = env_value("ELOWEN_ALLOWED_REPOS", env_overlay) {
+        return parse_list_value(&value);
+    }
+
+    if allowed_repo_roots.is_empty() {
+        return default.iter().map(|value| value.to_string()).collect();
+    }
+
+    Vec::new()
+}
+
+fn parse_json_list_env(key: &str, env_overlay: &EnvOverlay) -> anyhow::Result<Vec<String>> {
+    let Some(value) = env_value(key, env_overlay) else {
+        return Ok(Vec::new());
+    };
+
+    serde_json::from_str::<Vec<String>>(&value)
+        .with_context(|| format!("failed to parse {key} as a JSON string array"))
+}
+
+fn parse_list_value(value: &str) -> Vec<String> {
     let mut items = Vec::new();
 
     for candidate in value.split(',') {
@@ -189,13 +222,47 @@ fn parse_list_env(key: &str, default: &[&str], env_overlay: &EnvOverlay) -> Vec<
     items
 }
 
-fn parse_json_list_env(key: &str, env_overlay: &EnvOverlay) -> anyhow::Result<Vec<String>> {
+fn parse_repo_root_env(
+    key: &str,
+    workspace_root: &Path,
+    env_overlay: &EnvOverlay,
+) -> anyhow::Result<Vec<PathBuf>> {
     let Some(value) = env_value(key, env_overlay) else {
         return Ok(Vec::new());
     };
 
-    serde_json::from_str::<Vec<String>>(&value)
-        .with_context(|| format!("failed to parse {key} as a JSON string array"))
+    let mut roots = Vec::new();
+
+    for candidate in value.split(',') {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let raw_path = PathBuf::from(trimmed);
+        let resolved = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            workspace_root.join(raw_path)
+        };
+        let canonical = stdfs::canonicalize(&resolved)
+            .with_context(|| format!("failed to resolve repository root {}", resolved.display()))?;
+
+        if !canonical.is_dir() {
+            anyhow::bail!(
+                "configured repository root {} is not a directory",
+                canonical.display()
+            );
+        }
+
+        if roots.iter().any(|existing| existing == &canonical) {
+            continue;
+        }
+
+        roots.push(canonical);
+    }
+
+    Ok(roots)
 }
 
 fn startup_usage() -> &'static str {
@@ -216,4 +283,46 @@ fn parse_env_file_value(raw_value: &str) -> String {
     }
 
     raw_value.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnvOverlay, parse_allowed_repos_env, parse_repo_root_env};
+    use std::{fs, path::PathBuf};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("elowen-edge-config-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn repo_roots_are_resolved_relative_to_workspace() {
+        let workspace_root = unique_temp_dir("workspace");
+        let child = workspace_root.join("repos");
+        fs::create_dir_all(&child).unwrap();
+
+        let mut overlay = EnvOverlay::new();
+        overlay.insert("ELOWEN_ALLOWED_REPO_ROOTS".to_string(), "repos".to_string());
+
+        let roots =
+            parse_repo_root_env("ELOWEN_ALLOWED_REPO_ROOTS", &workspace_root, &overlay).unwrap();
+
+        assert_eq!(roots, vec![fs::canonicalize(child).unwrap()]);
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn explicit_allowlist_defaults_to_empty_when_roots_are_configured() {
+        let allowed_repos = parse_allowed_repos_env(
+            &["elowen-api"],
+            &[PathBuf::from("D:\\Projects")],
+            &EnvOverlay::new(),
+        );
+
+        assert!(allowed_repos.is_empty());
+    }
 }

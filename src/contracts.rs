@@ -30,6 +30,8 @@ pub(crate) struct RegisterDeviceRequest {
     pub(crate) name: String,
     pub(crate) primary_flag: bool,
     pub(crate) allowed_repos: Vec<String>,
+    pub(crate) allowed_repo_roots: Vec<String>,
+    pub(crate) discovered_repos: Vec<String>,
     pub(crate) capabilities: Vec<String>,
 }
 

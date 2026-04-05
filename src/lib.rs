@@ -10,7 +10,8 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    env,
+    collections::HashSet,
+    env, fs as stdfs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -382,6 +383,8 @@ impl SandboxMode {
 }
 
 async fn register_device(http: &HttpClient, config: &EdgeConfig) -> anyhow::Result<()> {
+    let discovered_repos = discover_repositories(&config.allowed_repo_roots)
+        .context("failed to discover repositories from configured roots")?;
     let response = http
         .put(format!(
             "{}/api/v1/devices/{}",
@@ -391,6 +394,12 @@ async fn register_device(http: &HttpClient, config: &EdgeConfig) -> anyhow::Resu
             name: config.device_name.clone(),
             primary_flag: config.primary_flag,
             allowed_repos: config.allowed_repos.clone(),
+            allowed_repo_roots: config
+                .allowed_repo_roots
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect(),
+            discovered_repos,
             capabilities: config.capabilities.clone(),
         })
         .send()
@@ -404,6 +413,77 @@ async fn register_device(http: &HttpClient, config: &EdgeConfig) -> anyhow::Resu
     }
 
     Ok(())
+}
+
+fn discover_repositories(roots: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+    let mut discovered = Vec::new();
+    let mut seen = HashSet::new();
+
+    for root in roots {
+        discover_repositories_from_root(root, &mut discovered, &mut seen)?;
+    }
+
+    discovered.sort();
+    Ok(discovered)
+}
+
+fn discover_repositories_from_root(
+    directory: &Path,
+    discovered: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> anyhow::Result<()> {
+    if contains_git_dir(directory)? {
+        if let Some(name) = directory.file_name().and_then(|value| value.to_str()) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                discovered.push(trimmed.to_string());
+            }
+        }
+
+        return Ok(());
+    }
+
+    for entry in stdfs::read_dir(directory)
+        .with_context(|| format!("failed to read repository root {}", directory.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to inspect {}", directory.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type for {}", entry.path().display()))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if should_skip_repo_scan_directory(name) {
+            continue;
+        }
+
+        discover_repositories_from_root(&path, discovered, seen)?;
+    }
+
+    Ok(())
+}
+
+fn contains_git_dir(directory: &Path) -> anyhow::Result<bool> {
+    let git_path = directory.join(".git");
+    match stdfs::metadata(&git_path) {
+        Ok(metadata) => Ok(metadata.is_dir() || metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {}", git_path.display()))
+        }
+    }
+}
+
+fn should_skip_repo_scan_directory(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".elowen" | "node_modules" | "target" | "dist" | "build" | ".next"
+    )
 }
 
 async fn wait_for_registration(http: &HttpClient, config: &EdgeConfig) {
@@ -2019,10 +2099,19 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SandboxMode, execution_intent_guidance, is_disallowed_validation_program,
-        validation_program_name,
+        SandboxMode, contains_git_dir, discover_repositories, execution_intent_guidance,
+        is_disallowed_validation_program, validation_program_name,
     };
     use crate::contracts::ExecutionIntent;
+    use std::{fs, path::PathBuf};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("elowen-edge-lib-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn sandbox_mode_defaults_to_workspace() {
@@ -2046,5 +2135,32 @@ mod tests {
         let guidance = execution_intent_guidance(&ExecutionIntent::ReadOnly);
         assert!(guidance.contains("do not create commits"));
         assert!(guidance.contains("do not ask for push approval"));
+    }
+
+    #[test]
+    fn discovery_collects_repo_names_from_parent_root() {
+        let root = unique_temp_dir("repo-discovery");
+        let api_repo = root.join("elowen-api");
+        let ui_repo = root.join("elowen-ui");
+        fs::create_dir_all(api_repo.join(".git")).unwrap();
+        fs::create_dir_all(ui_repo.join(".git")).unwrap();
+
+        let repos = discover_repositories(&[root.clone()]).unwrap();
+        assert_eq!(
+            repos,
+            vec!["elowen-api".to_string(), "elowen-ui".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_dir_detection_accepts_file_based_git_markers() {
+        let root = unique_temp_dir("git-file");
+        fs::write(root.join(".git"), "gitdir: ../.git/worktrees/example").unwrap();
+
+        assert!(contains_git_dir(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -37,6 +37,7 @@ Useful variables:
 - `ELOWEN_DEVICE_NAME`
 - `ELOWEN_DEVICE_PRIMARY`
 - `ELOWEN_ALLOWED_REPOS`
+- `ELOWEN_ALLOWED_REPO_ROOTS`
 - `ELOWEN_DEVICE_CAPABILITIES`
 - `ELOWEN_EDGE_WORKSPACE_ROOT`
 - `ELOWEN_EDGE_WORKTREE_ROOT`
@@ -47,6 +48,8 @@ Useful variables:
 - `RUST_LOG`
 
 See [edge.env.example](D:/Projects/elowen/elowen-edge/edge.env.example) for a standalone laptop template.
+
+`ELOWEN_ALLOWED_REPO_ROOTS` is the preferred way to declare accessible repositories. The edge discovers nested git repositories under those parent directories during registration. `ELOWEN_ALLOWED_REPOS` remains available as an explicit overlay when you need a manual supplement or exception.
 
 ## Real Codex runner
 
