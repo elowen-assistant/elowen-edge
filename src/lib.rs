@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::StreamExt;
+use rand::RngCore;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -131,6 +132,11 @@ fn init_tracing(service_name: &'static str, env_overlay: &EnvOverlay) {
 /// Starts the edge runtime.
 pub fn run() -> anyhow::Result<()> {
     let startup = parse_startup_options()?;
+    if startup.generate_trust_keypair {
+        print_trust_keypair();
+        return Ok(());
+    }
+
     let env_overlay = load_env_overlay(startup.env_file.as_deref())?;
     init_tracing("elowen-edge", &env_overlay);
 
@@ -144,6 +150,20 @@ pub fn run() -> anyhow::Result<()> {
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async_main(env_overlay))
+}
+
+fn print_trust_keypair() {
+    let mut private_key = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut private_key);
+    let signing_key = SigningKey::from_bytes(&private_key);
+
+    println!(
+        "{}",
+        json!({
+            "private_key": URL_SAFE_NO_PAD.encode(private_key),
+            "public_key": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+        })
+    );
 }
 
 async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {

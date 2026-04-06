@@ -303,6 +303,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "futures-util",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",

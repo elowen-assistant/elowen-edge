@@ -15,6 +15,7 @@ pub(crate) type EnvOverlay = HashMap<String, String>;
 /// Startup-only command-line options.
 pub(crate) struct StartupOptions {
     pub(crate) env_file: Option<PathBuf>,
+    pub(crate) generate_trust_keypair: bool,
 }
 
 /// Configuration required by the edge runtime after startup parsing.
@@ -106,10 +107,14 @@ impl EdgeConfig {
 /// Parses CLI startup arguments.
 pub(crate) fn parse_startup_options() -> anyhow::Result<StartupOptions> {
     let mut env_file = None;
+    let mut generate_trust_keypair = false;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--generate-trust-keypair" => {
+                generate_trust_keypair = true;
+            }
             "--env-file" => {
                 let value = args.next().context("missing value after --env-file")?;
                 env_file = Some(PathBuf::from(value));
@@ -129,7 +134,10 @@ pub(crate) fn parse_startup_options() -> anyhow::Result<StartupOptions> {
             .map(PathBuf::from);
     }
 
-    Ok(StartupOptions { env_file })
+    Ok(StartupOptions {
+        env_file,
+        generate_trust_keypair,
+    })
 }
 
 /// Loads optional env-file values while letting the process environment win.
@@ -270,10 +278,11 @@ fn parse_repo_root_env(
 }
 
 fn startup_usage() -> &'static str {
-    "Usage: elowen-edge [--env-file PATH]\n\n\
+    "Usage: elowen-edge [--env-file PATH] [--generate-trust-keypair]\n\n\
 Reads runtime configuration from the process environment. When --env-file is set,\n\
 the file is parsed first and the current process environment still wins on conflicts.\n\
-You can also set ELOWEN_EDGE_ENV_FILE instead of passing --env-file.\n"
+You can also set ELOWEN_EDGE_ENV_FILE instead of passing --env-file.\n\n\
+Use --generate-trust-keypair to print base64url Ed25519 key material for Slice 28 trusted registration.\n"
 }
 
 fn parse_env_file_value(raw_value: &str) -> String {
