@@ -33,6 +33,29 @@ pub(crate) struct RegisterDeviceRequest {
     pub(crate) allowed_repo_roots: Vec<String>,
     pub(crate) discovered_repos: Vec<String>,
     pub(crate) capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trust: Option<DeviceRegistrationTrustProof>,
+}
+
+/// Orchestrator-signed challenge used before trusted registration.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RegistrationChallengeResponse {
+    pub(crate) challenge_id: String,
+    pub(crate) challenge: String,
+    pub(crate) issued_at: DateTime<Utc>,
+    pub(crate) orchestrator_public_key: String,
+    pub(crate) signature: String,
+}
+
+/// Edge-signed proof attached to trusted registration requests.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DeviceRegistrationTrustProof {
+    pub(crate) orchestrator_challenge_id: String,
+    pub(crate) orchestrator_challenge: String,
+    pub(crate) orchestrator_challenge_issued_at: DateTime<Utc>,
+    pub(crate) orchestrator_signature: String,
+    pub(crate) edge_public_key: String,
+    pub(crate) edge_signature: String,
 }
 
 /// Dispatched execution request sent from the orchestrator to the edge.

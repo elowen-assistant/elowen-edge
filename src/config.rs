@@ -35,6 +35,8 @@ pub(crate) struct EdgeConfig {
     pub(crate) simulated_run_ms: u64,
     pub(crate) validation_timeout_secs: u64,
     pub(crate) sandbox_mode: SandboxMode,
+    pub(crate) orchestrator_public_key: Option<String>,
+    pub(crate) edge_signing_key: Option<String>,
 }
 
 impl EdgeConfig {
@@ -95,6 +97,8 @@ impl EdgeConfig {
             sandbox_mode: SandboxMode::from_env(
                 env_value("ELOWEN_SANDBOX_MODE", env_overlay).as_deref(),
             )?,
+            orchestrator_public_key: env_value("ELOWEN_ORCHESTRATOR_PUBLIC_KEY", env_overlay),
+            edge_signing_key: env_value("ELOWEN_EDGE_SIGNING_KEY", env_overlay),
         })
     }
 }

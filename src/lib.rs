@@ -4,7 +4,9 @@ mod config;
 mod contracts;
 
 use anyhow::Context;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::StreamExt;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -22,8 +24,9 @@ use tracing::{info, warn};
 
 use config::{EdgeConfig, EnvOverlay, env_value, load_env_overlay, parse_startup_options};
 use contracts::{
-    AvailabilityProbeMessage, AvailabilitySnapshot, ExecutionIntent, JobApprovalCommand,
-    JobDispatchMessage, JobLifecycleEvent, RegisterDeviceRequest,
+    AvailabilityProbeMessage, AvailabilitySnapshot, DeviceRegistrationTrustProof, ExecutionIntent,
+    JobApprovalCommand, JobDispatchMessage, JobLifecycleEvent, RegisterDeviceRequest,
+    RegistrationChallengeResponse,
 };
 
 struct CommandOutcome {
@@ -385,6 +388,7 @@ impl SandboxMode {
 async fn register_device(http: &HttpClient, config: &EdgeConfig) -> anyhow::Result<()> {
     let discovered_repos = discover_repositories(&config.allowed_repo_roots)
         .context("failed to discover repositories from configured roots")?;
+    let trust = build_registration_trust_proof(http, config).await?;
     let response = http
         .put(format!(
             "{}/api/v1/devices/{}",
@@ -401,6 +405,7 @@ async fn register_device(http: &HttpClient, config: &EdgeConfig) -> anyhow::Resu
                 .collect(),
             discovered_repos,
             capabilities: config.capabilities.clone(),
+            trust,
         })
         .send()
         .await
@@ -413,6 +418,145 @@ async fn register_device(http: &HttpClient, config: &EdgeConfig) -> anyhow::Resu
     }
 
     Ok(())
+}
+
+async fn build_registration_trust_proof(
+    http: &HttpClient,
+    config: &EdgeConfig,
+) -> anyhow::Result<Option<DeviceRegistrationTrustProof>> {
+    let Some(orchestrator_public_key) = config.orchestrator_public_key.as_deref() else {
+        return Ok(None);
+    };
+    let Some(edge_signing_key) = config.edge_signing_key.as_deref() else {
+        anyhow::bail!(
+            "ELOWEN_EDGE_SIGNING_KEY is required when ELOWEN_ORCHESTRATOR_PUBLIC_KEY is configured"
+        );
+    };
+
+    let pinned_orchestrator_key =
+        decode_verifying_key(orchestrator_public_key, "orchestrator public key")?;
+    let edge_signing_key = decode_signing_key(edge_signing_key, "edge signing key")?;
+    let challenge = fetch_registration_challenge(http, config).await?;
+
+    if challenge.orchestrator_public_key != orchestrator_public_key.trim() {
+        anyhow::bail!("registration challenge was signed by an unexpected orchestrator public key");
+    }
+
+    let challenge_signature =
+        decode_signature(&challenge.signature, "orchestrator challenge signature")?;
+    let challenge_payload = orchestrator_challenge_payload(
+        &challenge.challenge_id,
+        &challenge.challenge,
+        challenge.issued_at,
+    );
+    pinned_orchestrator_key
+        .verify(challenge_payload.as_bytes(), &challenge_signature)
+        .context("failed to verify orchestrator registration challenge signature")?;
+
+    let edge_public_key = URL_SAFE_NO_PAD.encode(edge_signing_key.verifying_key().to_bytes());
+    let registration_payload = edge_registration_payload(
+        &config.device_id,
+        &config.device_name,
+        config.primary_flag,
+        &challenge.challenge_id,
+        &challenge.challenge,
+        challenge.issued_at,
+        &edge_public_key,
+    );
+    let edge_signature = edge_signing_key.sign(registration_payload.as_bytes());
+
+    Ok(Some(DeviceRegistrationTrustProof {
+        orchestrator_challenge_id: challenge.challenge_id,
+        orchestrator_challenge: challenge.challenge,
+        orchestrator_challenge_issued_at: challenge.issued_at,
+        orchestrator_signature: challenge.signature,
+        edge_public_key,
+        edge_signature: URL_SAFE_NO_PAD.encode(edge_signature.to_bytes()),
+    }))
+}
+
+async fn fetch_registration_challenge(
+    http: &HttpClient,
+    config: &EdgeConfig,
+) -> anyhow::Result<RegistrationChallengeResponse> {
+    let response = http
+        .get(format!(
+            "{}/api/v1/trust/registration-challenge",
+            config.api_url
+        ))
+        .send()
+        .await
+        .context("failed to fetch registration challenge")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("registration challenge failed with status {status}: {body}");
+    }
+
+    response
+        .json::<RegistrationChallengeResponse>()
+        .await
+        .context("failed to decode registration challenge")
+}
+
+fn decode_signing_key(value: &str, label: &str) -> anyhow::Result<SigningKey> {
+    let bytes = decode_base64_bytes(value, label)?;
+    let key_bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .with_context(|| format!("{label} must decode to a 32-byte Ed25519 private key"))?;
+
+    Ok(SigningKey::from_bytes(&key_bytes))
+}
+
+fn decode_verifying_key(value: &str, label: &str) -> anyhow::Result<VerifyingKey> {
+    let bytes = decode_base64_bytes(value, label)?;
+    let key_bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .with_context(|| format!("{label} must decode to a 32-byte Ed25519 public key"))?;
+
+    VerifyingKey::from_bytes(&key_bytes)
+        .with_context(|| format!("{label} is not a valid Ed25519 key"))
+}
+
+fn decode_signature(value: &str, label: &str) -> anyhow::Result<Signature> {
+    let bytes = decode_base64_bytes(value, label)?;
+    Signature::from_slice(&bytes)
+        .with_context(|| format!("{label} must decode to a 64-byte Ed25519 signature"))
+}
+
+fn decode_base64_bytes(value: &str, label: &str) -> anyhow::Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .with_context(|| format!("{label} is not valid base64url"))
+}
+
+fn orchestrator_challenge_payload(
+    challenge_id: &str,
+    challenge: &str,
+    issued_at: DateTime<Utc>,
+) -> String {
+    format!(
+        "elowen-orchestrator-registration-challenge\n{challenge_id}\n{challenge}\n{}",
+        issued_at.to_rfc3339()
+    )
+}
+
+fn edge_registration_payload(
+    device_id: &str,
+    name: &str,
+    primary_flag: bool,
+    challenge_id: &str,
+    challenge: &str,
+    challenge_issued_at: DateTime<Utc>,
+    edge_public_key: &str,
+) -> String {
+    format!(
+        "elowen-edge-registration\n{device_id}\n{name}\n{primary_flag}\n{challenge_id}\n{challenge}\n{}\n{edge_public_key}",
+        challenge_issued_at.to_rfc3339()
+    )
 }
 
 fn discover_repositories(roots: &[PathBuf]) -> anyhow::Result<Vec<String>> {
@@ -432,12 +576,12 @@ fn discover_repositories_from_root(
     discovered: &mut Vec<String>,
     seen: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
-    if contains_git_dir(directory)? {
-        if let Some(name) = directory.file_name().and_then(|value| value.to_str()) {
-            let trimmed = name.trim();
-            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-                discovered.push(trimmed.to_string());
-            }
+    if contains_git_dir(directory)?
+        && let Some(name) = directory.file_name().and_then(|value| value.to_str())
+    {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            discovered.push(trimmed.to_string());
         }
     }
 
@@ -2204,7 +2348,7 @@ mod tests {
         fs::create_dir_all(api_repo.join(".git")).unwrap();
         fs::create_dir_all(ui_repo.join(".git")).unwrap();
 
-        let repos = discover_repositories(&[root.clone()]).unwrap();
+        let repos = discover_repositories(std::slice::from_ref(&root)).unwrap();
         assert_eq!(
             repos,
             vec![
