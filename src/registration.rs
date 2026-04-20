@@ -12,7 +12,7 @@ use crate::{
     contracts::{
         DeviceRegistrationTrustProof, RegisterDeviceRequest, RegistrationChallengeResponse,
     },
-    discovery::discover_repositories,
+    discovery::{discover_repositories, discover_repository_catalog},
 };
 
 pub(crate) fn print_trust_keypair() {
@@ -42,8 +42,16 @@ pub(crate) async fn wait_for_registration(http: &HttpClient, config: &EdgeConfig
 }
 
 pub(crate) async fn register_device(http: &HttpClient, config: &EdgeConfig) -> anyhow::Result<()> {
-    let discovered_repos = discover_repositories(&config.allowed_repo_roots)
-        .context("failed to discover repositories from configured roots")?;
+    let discovered_repos = discover_repositories(
+        &config.allowed_repo_roots,
+        &config.excluded_repo_paths,
+    )
+    .context("failed to discover repositories from configured roots")?;
+    let repositories = discover_repository_catalog(
+        &config.allowed_repo_roots,
+        &config.excluded_repo_paths,
+    )
+    .context("failed to discover repository catalog from configured roots")?;
     let trust = build_registration_trust_proof(http, config).await?;
     let response = http
         .put(format!(
@@ -59,7 +67,14 @@ pub(crate) async fn register_device(http: &HttpClient, config: &EdgeConfig) -> a
                 .iter()
                 .map(|path| path.to_string_lossy().to_string())
                 .collect(),
+            hidden_repos: config.hidden_repos.clone(),
+            excluded_repo_paths: config
+                .excluded_repo_paths
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect(),
             discovered_repos,
+            repositories,
             capabilities: config.capabilities.clone(),
             trust,
         })
@@ -136,7 +151,10 @@ async fn fetch_registration_challenge(
     config: &EdgeConfig,
 ) -> anyhow::Result<RegistrationChallengeResponse> {
     let response = http
-        .get(format!("{}/api/v1/registration-challenge", config.api_url))
+        .get(format!(
+            "{}/api/v1/trust/registration-challenge",
+            config.api_url
+        ))
         .send()
         .await
         .context("failed to request registration challenge")?;

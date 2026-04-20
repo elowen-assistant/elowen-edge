@@ -24,6 +24,13 @@ impl ExecutionIntent {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DeviceRepository {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) branches: Vec<String>,
+}
+
 /// Device registration payload sent to the orchestrator API.
 #[derive(Debug, Serialize)]
 pub(crate) struct RegisterDeviceRequest {
@@ -31,7 +38,10 @@ pub(crate) struct RegisterDeviceRequest {
     pub(crate) primary_flag: bool,
     pub(crate) allowed_repos: Vec<String>,
     pub(crate) allowed_repo_roots: Vec<String>,
+    pub(crate) hidden_repos: Vec<String>,
+    pub(crate) excluded_repo_paths: Vec<String>,
     pub(crate) discovered_repos: Vec<String>,
+    pub(crate) repositories: Vec<DeviceRepository>,
     pub(crate) capabilities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) trust: Option<DeviceRegistrationTrustProof>,

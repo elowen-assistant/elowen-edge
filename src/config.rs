@@ -28,6 +28,8 @@ pub(crate) struct EdgeConfig {
     pub(crate) primary_flag: bool,
     pub(crate) allowed_repos: Vec<String>,
     pub(crate) allowed_repo_roots: Vec<PathBuf>,
+    pub(crate) hidden_repos: Vec<String>,
+    pub(crate) excluded_repo_paths: Vec<PathBuf>,
     pub(crate) capabilities: Vec<String>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) worktree_root: PathBuf,
@@ -55,6 +57,12 @@ impl EdgeConfig {
             .unwrap_or_else(|| workspace_root.join(".elowen").join("worktrees"));
         let allowed_repo_roots =
             parse_repo_root_env("ELOWEN_ALLOWED_REPO_ROOTS", &workspace_root, env_overlay)?;
+        let excluded_repo_paths = parse_repo_policy_path_env(
+            "ELOWEN_REPO_SCAN_EXCLUDE_PATHS",
+            &workspace_root,
+            &allowed_repo_roots,
+            env_overlay,
+        )?;
 
         Ok(Self {
             api_url: env_value("ELOWEN_API_URL", env_overlay)
@@ -80,6 +88,8 @@ impl EdgeConfig {
                 env_overlay,
             ),
             allowed_repo_roots,
+            hidden_repos: parse_list_env("ELOWEN_HIDDEN_REPOS", &[], env_overlay),
+            excluded_repo_paths,
             capabilities: parse_list_env(
                 "ELOWEN_DEVICE_CAPABILITIES",
                 &["codex", "git", "build", "test"],
@@ -277,6 +287,57 @@ fn parse_repo_root_env(
     Ok(roots)
 }
 
+fn parse_repo_policy_path_env(
+    key: &str,
+    workspace_root: &Path,
+    allowed_repo_roots: &[PathBuf],
+    env_overlay: &EnvOverlay,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let Some(value) = env_value(key, env_overlay) else {
+        return Ok(Vec::new());
+    };
+
+    let mut paths = Vec::new();
+
+    for candidate in value.split(',') {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let raw_path = PathBuf::from(trimmed);
+        let resolved = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            workspace_root.join(raw_path)
+        };
+        let canonical = stdfs::canonicalize(&resolved)
+            .with_context(|| format!("failed to resolve repository policy path {}", resolved.display()))?;
+
+        if !canonical.exists() {
+            anyhow::bail!(
+                "configured repository policy path {} does not exist",
+                canonical.display()
+            );
+        }
+
+        if !allowed_repo_roots.iter().any(|root| canonical.starts_with(root)) {
+            anyhow::bail!(
+                "configured repository policy path {} is outside the trusted repository roots",
+                canonical.display()
+            );
+        }
+
+        if paths.iter().any(|existing| existing == &canonical) {
+            continue;
+        }
+
+        paths.push(canonical);
+    }
+
+    Ok(paths)
+}
+
 fn startup_usage() -> &'static str {
     "Usage: elowen-edge [--env-file PATH] [--generate-trust-keypair]\n\n\
 Reads runtime configuration from the process environment. When --env-file is set,\n\
@@ -300,7 +361,9 @@ fn parse_env_file_value(raw_value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvOverlay, parse_allowed_repos_env, parse_repo_root_env};
+    use super::{
+        EnvOverlay, parse_allowed_repos_env, parse_repo_policy_path_env, parse_repo_root_env,
+    };
     use std::{fs, path::PathBuf};
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -337,5 +400,31 @@ mod tests {
         );
 
         assert!(allowed_repos.is_empty());
+    }
+
+    #[test]
+    fn excluded_repo_paths_resolve_under_trusted_roots() {
+        let workspace_root = unique_temp_dir("policy-workspace");
+        let repos_root = workspace_root.join("repos");
+        let excluded = repos_root.join("private");
+        fs::create_dir_all(&excluded).unwrap();
+
+        let mut overlay = EnvOverlay::new();
+        overlay.insert(
+            "ELOWEN_REPO_SCAN_EXCLUDE_PATHS".to_string(),
+            "repos/private".to_string(),
+        );
+
+        let paths = parse_repo_policy_path_env(
+            "ELOWEN_REPO_SCAN_EXCLUDE_PATHS",
+            &workspace_root,
+            &[fs::canonicalize(&repos_root).unwrap()],
+            &overlay,
+        )
+        .unwrap();
+
+        assert_eq!(paths, vec![fs::canonicalize(excluded).unwrap()]);
+
+        let _ = fs::remove_dir_all(workspace_root);
     }
 }
