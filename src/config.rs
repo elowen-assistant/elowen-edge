@@ -38,8 +38,16 @@ pub(crate) struct EdgeConfig {
     pub(crate) simulated_run_ms: u64,
     pub(crate) validation_timeout_secs: u64,
     pub(crate) sandbox_mode: SandboxMode,
-    pub(crate) orchestrator_public_key: Option<String>,
+    pub(crate) trusted_orchestrator_keys: Vec<TrustedOrchestratorKey>,
     pub(crate) edge_signing_key: Option<String>,
+    pub(crate) previous_edge_signing_key: Option<String>,
+}
+
+/// Trusted orchestrator signing key accepted for challenge verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrustedOrchestratorKey {
+    pub(crate) key_id: Option<String>,
+    pub(crate) public_key: String,
 }
 
 impl EdgeConfig {
@@ -108,8 +116,9 @@ impl EdgeConfig {
             sandbox_mode: SandboxMode::from_env(
                 env_value("ELOWEN_SANDBOX_MODE", env_overlay).as_deref(),
             )?,
-            orchestrator_public_key: env_value("ELOWEN_ORCHESTRATOR_PUBLIC_KEY", env_overlay),
+            trusted_orchestrator_keys: parse_trusted_orchestrator_keys(env_overlay)?,
             edge_signing_key: env_value("ELOWEN_EDGE_SIGNING_KEY", env_overlay),
+            previous_edge_signing_key: env_value("ELOWEN_PREVIOUS_EDGE_SIGNING_KEY", env_overlay),
         })
     }
 }
@@ -311,8 +320,12 @@ fn parse_repo_policy_path_env(
         } else {
             workspace_root.join(raw_path)
         };
-        let canonical = stdfs::canonicalize(&resolved)
-            .with_context(|| format!("failed to resolve repository policy path {}", resolved.display()))?;
+        let canonical = stdfs::canonicalize(&resolved).with_context(|| {
+            format!(
+                "failed to resolve repository policy path {}",
+                resolved.display()
+            )
+        })?;
 
         if !canonical.exists() {
             anyhow::bail!(
@@ -321,7 +334,10 @@ fn parse_repo_policy_path_env(
             );
         }
 
-        if !allowed_repo_roots.iter().any(|root| canonical.starts_with(root)) {
+        if !allowed_repo_roots
+            .iter()
+            .any(|root| canonical.starts_with(root))
+        {
             anyhow::bail!(
                 "configured repository policy path {} is outside the trusted repository roots",
                 canonical.display()
@@ -346,6 +362,80 @@ You can also set ELOWEN_EDGE_ENV_FILE instead of passing --env-file.\n\n\
 Use --generate-trust-keypair to print base64url Ed25519 key material for Slice 28 trusted registration.\n"
 }
 
+fn parse_trusted_orchestrator_keys(
+    env_overlay: &EnvOverlay,
+) -> anyhow::Result<Vec<TrustedOrchestratorKey>> {
+    let mut keys = Vec::new();
+
+    if let Some(value) = env_value("ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON", env_overlay) {
+        let parsed = serde_json::from_str::<Vec<TrustedOrchestratorKeyEnv>>(&value)
+            .context("failed to parse ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON")?;
+
+        for entry in parsed {
+            let public_key = entry.public_key.trim();
+            if public_key.is_empty() {
+                anyhow::bail!(
+                    "ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON cannot contain empty public keys"
+                );
+            }
+
+            push_unique_orchestrator_key(
+                &mut keys,
+                TrustedOrchestratorKey {
+                    key_id: entry
+                        .key_id
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty()),
+                    public_key: public_key.to_string(),
+                },
+            );
+        }
+    }
+
+    if let Some(value) = env_value("ELOWEN_ORCHESTRATOR_PUBLIC_KEYS", env_overlay) {
+        for public_key in parse_list_value(&value) {
+            push_unique_orchestrator_key(
+                &mut keys,
+                TrustedOrchestratorKey {
+                    key_id: None,
+                    public_key,
+                },
+            );
+        }
+    }
+
+    if let Some(value) = env_value("ELOWEN_ORCHESTRATOR_PUBLIC_KEY", env_overlay) {
+        push_unique_orchestrator_key(
+            &mut keys,
+            TrustedOrchestratorKey {
+                key_id: None,
+                public_key: value,
+            },
+        );
+    }
+
+    Ok(keys)
+}
+
+fn push_unique_orchestrator_key(
+    keys: &mut Vec<TrustedOrchestratorKey>,
+    candidate: TrustedOrchestratorKey,
+) {
+    let duplicate = keys.iter().any(|existing| {
+        existing.public_key == candidate.public_key && existing.key_id == candidate.key_id
+    });
+    if !duplicate {
+        keys.push(candidate);
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TrustedOrchestratorKeyEnv {
+    #[serde(default)]
+    key_id: Option<String>,
+    public_key: String,
+}
+
 fn parse_env_file_value(raw_value: &str) -> String {
     if raw_value.len() >= 2 {
         let bytes = raw_value.as_bytes();
@@ -362,7 +452,8 @@ fn parse_env_file_value(raw_value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnvOverlay, parse_allowed_repos_env, parse_repo_policy_path_env, parse_repo_root_env,
+        EnvOverlay, TrustedOrchestratorKey, parse_allowed_repos_env, parse_repo_policy_path_env,
+        parse_repo_root_env, parse_trusted_orchestrator_keys,
     };
     use std::{fs, path::PathBuf};
 
@@ -426,5 +517,51 @@ mod tests {
         assert_eq!(paths, vec![fs::canonicalize(excluded).unwrap()]);
 
         let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn trusted_orchestrator_keys_support_json_and_legacy_envs() {
+        let mut overlay = EnvOverlay::new();
+        overlay.insert(
+            "ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON".to_string(),
+            r#"[{"key_id":"current","public_key":"key-a"},{"key_id":"next","public_key":"key-b"}]"#
+                .to_string(),
+        );
+        overlay.insert(
+            "ELOWEN_ORCHESTRATOR_PUBLIC_KEY".to_string(),
+            "key-b".to_string(),
+        );
+        overlay.insert(
+            "ELOWEN_ORCHESTRATOR_PUBLIC_KEYS".to_string(),
+            "key-c,key-a".to_string(),
+        );
+
+        let keys = parse_trusted_orchestrator_keys(&overlay).unwrap();
+
+        assert_eq!(
+            keys,
+            vec![
+                TrustedOrchestratorKey {
+                    key_id: Some("current".to_string()),
+                    public_key: "key-a".to_string(),
+                },
+                TrustedOrchestratorKey {
+                    key_id: Some("next".to_string()),
+                    public_key: "key-b".to_string(),
+                },
+                TrustedOrchestratorKey {
+                    key_id: None,
+                    public_key: "key-c".to_string(),
+                },
+                TrustedOrchestratorKey {
+                    key_id: None,
+                    public_key: "key-a".to_string(),
+                },
+                TrustedOrchestratorKey {
+                    key_id: None,
+                    public_key: "key-b".to_string(),
+                },
+            ]
+        );
     }
 }

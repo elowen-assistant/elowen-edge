@@ -13,7 +13,7 @@ Rust edge runtime that executes dispatched work on a trusted device. It register
 - run Codex or the simulated runner inside the worktree
 - execute repository validation commands and classify sandbox or validation failures
 - gate pushes behind explicit approval commands
-- generate and verify trusted registration material for orchestrator enrollment
+- generate and verify trusted registration material for orchestrator enrollment, rotation, and re-enrollment
 
 ## Repository Layout
 
@@ -50,14 +50,37 @@ Important environment variables:
 - `ELOWEN_CODEX_COMMAND`
 - `ELOWEN_CODEX_ARGS_JSON`
 - `ELOWEN_SANDBOX_MODE`
-- `ELOWEN_ORCHESTRATOR_PUBLIC_KEY`
+- `ELOWEN_ORCHESTRATOR_PUBLIC_KEY` or `ELOWEN_ORCHESTRATOR_PUBLIC_KEYS`
+- `ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON`
 - `ELOWEN_EDGE_SIGNING_KEY`
+- `ELOWEN_PREVIOUS_EDGE_SIGNING_KEY`
 
 Generate trust key material with:
 
 ```powershell
 elowen-edge --generate-trust-keypair
 ```
+
+## Trusted Registration Lifecycle
+
+The edge keeps orchestrator challenge verification strict:
+
+- a registration challenge is accepted only if its public key matches a locally pinned orchestrator key
+- if the API includes an `orchestrator_key_id`, the edge also requires that key id to match a pinned entry
+- unknown orchestrator keys are rejected even during a rotation window
+
+Recommended operator setup:
+
+1. For steady state, pin the orchestrator with `ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON` or `ELOWEN_ORCHESTRATOR_PUBLIC_KEYS`.
+2. During orchestrator rotation, keep both the current and next orchestrator public keys pinned locally until the old signer is retired.
+3. During edge signing-key rotation, set `ELOWEN_EDGE_SIGNING_KEY` to the new private key and `ELOWEN_PREVIOUS_EDGE_SIGNING_KEY` to the old private key for the re-enrollment window.
+4. After the API confirms the new edge key is trusted, remove `ELOWEN_PREVIOUS_EDGE_SIGNING_KEY`.
+
+Multi-edge enrollment guidance:
+
+- assign each edge a stable `ELOWEN_DEVICE_ID`; do not reuse another device's id for an additional laptop or host
+- treat `ELOWEN_PREVIOUS_EDGE_SIGNING_KEY` as a re-enrollment tool for one existing device, not as a way to clone trust onto a second device
+- keep per-device env files separate so orchestrator pins and edge keys cannot be mixed up across machines
 
 ## Local Verification
 

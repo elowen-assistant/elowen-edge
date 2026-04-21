@@ -42,7 +42,10 @@ fn discover_repositories_from_root(
     discovered: &mut Vec<DeviceRepository>,
     seen: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
-    if excluded_paths.iter().any(|excluded| directory.starts_with(excluded)) {
+    if excluded_paths
+        .iter()
+        .any(|excluded| directory.starts_with(excluded))
+    {
         return Ok(());
     }
 
@@ -109,7 +112,10 @@ fn find_repo_root_in_directory(
     excluded_paths: &[PathBuf],
     repo_name: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    if excluded_paths.iter().any(|excluded| directory.starts_with(excluded)) {
+    if excluded_paths
+        .iter()
+        .any(|excluded| directory.starts_with(excluded))
+    {
         return Ok(None);
     }
 
@@ -225,11 +231,17 @@ fn branch_priority(branch: &str) -> (u8, String) {
 #[cfg(test)]
 mod tests {
     use super::{discover_repositories, discover_repository_catalog, find_repo_root_in_directory};
-    use std::{fs, path::{Path, PathBuf}, process::Command};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     fn unique_temp_dir(label: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("elowen-edge-discovery-{label}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "elowen-edge-discovery-{label}-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -257,7 +269,7 @@ mod tests {
 
         let discovered = discover_repositories(
             &[fs::canonicalize(&root).unwrap()],
-            &[fs::canonicalize(hidden_parent).unwrap()],
+            &[fs::canonicalize(&hidden_parent).unwrap()],
         )
         .unwrap();
 
@@ -265,7 +277,7 @@ mod tests {
 
         let catalog = discover_repository_catalog(
             &[fs::canonicalize(&root).unwrap()],
-            &[fs::canonicalize(hidden_parent).unwrap()],
+            &[fs::canonicalize(&hidden_parent).unwrap()],
         )
         .unwrap();
         assert_eq!(catalog.len(), 1);
@@ -283,7 +295,7 @@ mod tests {
 
         let resolved = find_repo_root_in_directory(
             &fs::canonicalize(&root).unwrap(),
-            &[fs::canonicalize(hidden_parent).unwrap()],
+            &[fs::canonicalize(&hidden_parent).unwrap()],
             "hidden-repo",
         )
         .unwrap();

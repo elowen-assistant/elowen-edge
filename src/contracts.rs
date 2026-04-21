@@ -53,6 +53,8 @@ pub(crate) struct RegistrationChallengeResponse {
     pub(crate) challenge_id: String,
     pub(crate) challenge: String,
     pub(crate) issued_at: DateTime<Utc>,
+    #[serde(default)]
+    pub(crate) orchestrator_key_id: Option<String>,
     pub(crate) orchestrator_public_key: String,
     pub(crate) signature: String,
 }
@@ -60,12 +62,25 @@ pub(crate) struct RegistrationChallengeResponse {
 /// Edge-signed proof attached to trusted registration requests.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DeviceRegistrationTrustProof {
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) trusted_orchestrator_public_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trusted_orchestrator_key_ids: Option<Vec<String>>,
+    pub(crate) orchestrator_key_id: String,
     pub(crate) orchestrator_challenge_id: String,
     pub(crate) orchestrator_challenge: String,
     pub(crate) orchestrator_challenge_issued_at: DateTime<Utc>,
+    pub(crate) orchestrator_public_key: String,
     pub(crate) orchestrator_signature: String,
     pub(crate) edge_public_key: String,
     pub(crate) edge_signature: String,
+    pub(crate) registration_intent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_edge_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_edge_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reenrollment_kind: Option<String>,
 }
 
 /// Dispatched execution request sent from the orchestrator to the edge.
