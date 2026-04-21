@@ -131,6 +131,12 @@ async fn build_registration_trust_proof(
         &challenge.challenge_id,
         &challenge.challenge,
         challenge.issued_at,
+        challenge
+            .orchestrator_key_id
+            .as_deref()
+            .or(orchestrator_key.key_id.as_deref())
+            .unwrap_or(challenge.orchestrator_public_key.as_str()),
+        &challenge.orchestrator_public_key,
         &edge_public_key,
     );
     let edge_signature = edge_signing_key.sign(registration_payload.as_bytes());
@@ -152,6 +158,12 @@ async fn build_registration_trust_proof(
             &challenge.challenge_id,
             &challenge.challenge,
             challenge.issued_at,
+            challenge
+                .orchestrator_key_id
+                .as_deref()
+                .or(orchestrator_key.key_id.as_deref())
+                .unwrap_or(challenge.orchestrator_public_key.as_str()),
+            &challenge.orchestrator_public_key,
             &previous_edge_public_key,
         );
         let previous_edge_signature = previous_key.sign(previous_registration_payload.as_bytes());
@@ -283,7 +295,11 @@ fn select_trusted_orchestrator_key<'a>(
         }
 
         match challenge_key_id {
-            Some(expected_key_id) => entry.key_id.as_deref() == Some(expected_key_id),
+            Some(expected_key_id) => entry
+                .key_id
+                .as_deref()
+                .map(|configured_key_id| configured_key_id == expected_key_id)
+                .unwrap_or(true),
             None => true,
         }
     });
@@ -319,10 +335,12 @@ fn edge_registration_payload(
     challenge_id: &str,
     challenge: &str,
     challenge_issued_at: DateTime<Utc>,
+    orchestrator_key_id: &str,
+    orchestrator_public_key: &str,
     edge_public_key: &str,
 ) -> String {
     format!(
-        "elowen-edge-registration\n{device_id}\n{name}\n{primary_flag}\n{challenge_id}\n{challenge}\n{}\n{edge_public_key}",
+        "elowen-edge-registration\n{device_id}\n{name}\n{primary_flag}\n{challenge_id}\n{challenge}\n{}\n{orchestrator_key_id}\n{orchestrator_public_key}\n{edge_public_key}",
         challenge_issued_at.to_rfc3339()
     )
 }
@@ -420,6 +438,32 @@ mod tests {
     }
 
     #[test]
+    fn accepts_public_key_only_pin_when_challenge_includes_key_id() {
+        let current = signing_key(10);
+        let trusted = parse_trusted_orchestrator_keys(&[TrustedOrchestratorKey {
+            key_id: None,
+            public_key: URL_SAFE_NO_PAD.encode(current.verifying_key().to_bytes()),
+        }])
+        .unwrap();
+        let challenge = RegistrationChallengeResponse {
+            challenge_id: "challenge-compat".to_string(),
+            challenge: "token".to_string(),
+            issued_at: Utc::now(),
+            orchestrator_key_id: Some("orchestrator-1-current".to_string()),
+            orchestrator_public_key: URL_SAFE_NO_PAD.encode(current.verifying_key().to_bytes()),
+            signature: "signature".to_string(),
+        };
+
+        let selected = select_trusted_orchestrator_key(&trusted, &challenge).unwrap();
+
+        assert_eq!(selected.key_id, None);
+        assert_eq!(
+            selected.public_key,
+            URL_SAFE_NO_PAD.encode(current.verifying_key().to_bytes())
+        );
+    }
+
+    #[test]
     fn reenrollment_proof_can_bind_previous_and_current_edge_keys() {
         let current = signing_key(11);
         let previous = signing_key(12);
@@ -435,6 +479,8 @@ mod tests {
             challenge_id,
             challenge,
             issued_at,
+            "orchestrator-1-current",
+            "pinned-key",
             &current_public_key,
         );
         let previous_payload = edge_registration_payload(
@@ -444,6 +490,8 @@ mod tests {
             challenge_id,
             challenge,
             issued_at,
+            "orchestrator-1-current",
+            "pinned-key",
             &previous_public_key,
         );
         let proof = DeviceRegistrationTrustProof {
