@@ -14,32 +14,54 @@ pub(crate) type EnvOverlay = HashMap<String, String>;
 
 /// Startup-only command-line options.
 pub(crate) struct StartupOptions {
+    /// Optional env file loaded before runtime config parsing.
     pub(crate) env_file: Option<PathBuf>,
+    /// Prints a new trust keypair and exits without starting the runtime.
     pub(crate) generate_trust_keypair: bool,
 }
 
 /// Configuration required by the edge runtime after startup parsing.
 #[derive(Clone)]
 pub(crate) struct EdgeConfig {
+    /// Base URL for the orchestrator API.
     pub(crate) api_url: String,
+    /// NATS connection string used for probes, dispatch, and events.
     pub(crate) nats_url: String,
+    /// Stable device identity published to the orchestrator.
     pub(crate) device_id: String,
+    /// Operator-visible device label.
     pub(crate) device_name: String,
+    /// Marks whether this device should be treated as the primary edge.
     pub(crate) primary_flag: bool,
+    /// Explicit repository names allowed for dispatch.
     pub(crate) allowed_repos: Vec<String>,
+    /// Trusted parent directories scanned for nested repositories.
     pub(crate) allowed_repo_roots: Vec<PathBuf>,
+    /// Discovered repos that should be hidden from dispatch selection.
     pub(crate) hidden_repos: Vec<String>,
+    /// Nested paths under trusted roots that must not be scanned.
     pub(crate) excluded_repo_paths: Vec<PathBuf>,
+    /// Capability strings advertised during registration.
     pub(crate) capabilities: Vec<String>,
+    /// Workspace root used for local repo discovery defaults.
     pub(crate) workspace_root: PathBuf,
+    /// Root folder under which disposable job worktrees are created.
     pub(crate) worktree_root: PathBuf,
+    /// External Codex executable, if real runner mode is enabled.
     pub(crate) codex_command: Option<String>,
+    /// Extra CLI arguments forwarded to the Codex command.
     pub(crate) codex_args: Vec<String>,
+    /// Duration used by the simulated runner path.
     pub(crate) simulated_run_ms: u64,
+    /// Timeout applied to repository validation commands.
     pub(crate) validation_timeout_secs: u64,
+    /// Sandbox boundary applied around worktree execution.
     pub(crate) sandbox_mode: SandboxMode,
+    /// Orchestrator keys pinned locally for trusted registration.
     pub(crate) trusted_orchestrator_keys: Vec<TrustedOrchestratorKey>,
+    /// Current edge signing key used for trusted registration.
     pub(crate) edge_signing_key: Option<String>,
+    /// Previous edge signing key used during trusted re-enrollment.
     pub(crate) previous_edge_signing_key: Option<String>,
 }
 
@@ -199,6 +221,8 @@ pub(crate) fn load_env_overlay(env_file: Option<&Path>) -> anyhow::Result<EnvOve
     Ok(env_overlay)
 }
 
+/// Returns a trimmed config value, preferring the env file overlay over the
+/// inherited process environment.
 pub(crate) fn env_value(key: &str, env_overlay: &EnvOverlay) -> Option<String> {
     env_overlay
         .get(key)

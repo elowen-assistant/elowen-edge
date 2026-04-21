@@ -26,6 +26,8 @@ pub(crate) fn discover_repository_catalog(
     Ok(discovered)
 }
 
+/// Discovers only repository names for registration payloads that do not need
+/// branch metadata.
 pub(crate) fn discover_repositories(
     roots: &[PathBuf],
     excluded_paths: &[PathBuf],
@@ -86,6 +88,7 @@ fn discover_repositories_from_root(
     Ok(())
 }
 
+/// Resolves a dispatch-selected repository name into the local checkout root.
 pub(crate) fn resolve_repo_root(config: &EdgeConfig, repo_name: &str) -> anyhow::Result<PathBuf> {
     let mut search_roots = vec![config.workspace_root.clone()];
     for root in &config.allowed_repo_roots {
@@ -173,6 +176,7 @@ fn should_skip_repo_scan_directory(name: &str) -> bool {
     )
 }
 
+/// Derives a stable default device id from the current host name.
 pub(crate) fn detect_device_id() -> String {
     env::var("COMPUTERNAME")
         .or_else(|_| env::var("HOSTNAME"))
@@ -182,6 +186,7 @@ pub(crate) fn detect_device_id() -> String {
         .unwrap_or_else(|| "elowen-edge".to_string())
 }
 
+/// Derives the default display name shown to operators.
 pub(crate) fn detect_device_name(device_id: &str) -> String {
     env::var("COMPUTERNAME")
         .or_else(|_| env::var("HOSTNAME"))

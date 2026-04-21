@@ -17,7 +17,9 @@ pub(crate) const SANDBOX_ERROR_PREFIX: &str = "sandbox blocked: ";
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SandboxMode {
+    /// Skip worktree isolation and allow local debugging without containment.
     Off,
+    /// Restrict temporary files, caches, and validation commands to the job worktree.
     Workspace,
 }
 
@@ -48,14 +50,21 @@ impl SandboxMode {
 
 #[derive(Clone)]
 pub(crate) struct SandboxPolicy {
+    /// Effective sandbox mode for the current job.
     pub(crate) mode: SandboxMode,
+    /// Canonicalized job worktree path.
     pub(crate) worktree_path: PathBuf,
+    /// Root directory for sandbox artifacts written inside the worktree.
     pub(crate) sandbox_root: PathBuf,
+    /// Redirected temp directory for child processes.
     pub(crate) temp_root: PathBuf,
+    /// Redirected cache directory for child processes.
     pub(crate) cache_root: PathBuf,
+    /// JSON artifact that records the generated sandbox policy.
     pub(crate) policy_path: PathBuf,
 }
 
+/// Creates the on-disk sandbox layout and policy artifact for one job worktree.
 pub(crate) async fn prepare_sandbox_policy(
     config: &EdgeConfig,
     worktree_path: &Path,
@@ -91,6 +100,7 @@ pub(crate) async fn prepare_sandbox_policy(
     Ok(policy)
 }
 
+/// Serializes the sandbox policy in the same shape emitted to runner artifacts.
 pub(crate) fn sandbox_report_value(policy: &SandboxPolicy) -> Value {
     json!({
         "mode": policy.mode.as_str(),
@@ -116,6 +126,7 @@ pub(crate) fn sandbox_report_value(policy: &SandboxPolicy) -> Value {
     })
 }
 
+/// Applies sandbox-related environment variables to a spawned child process.
 pub(crate) fn apply_sandbox_environment(command: &mut Command, policy: &SandboxPolicy) {
     command
         .env("TMP", &policy.temp_root)
@@ -133,6 +144,7 @@ pub(crate) fn apply_sandbox_environment(command: &mut Command, policy: &SandboxP
         .env("ELOWEN_SANDBOX_WORKTREE", &policy.worktree_path);
 }
 
+/// Ensures a path resolves underneath the configured worktree root.
 pub(crate) async fn enforce_worktree_containment(
     worktree_root: &Path,
     candidate: &Path,
@@ -155,6 +167,8 @@ pub(crate) async fn enforce_worktree_containment(
     Ok(resolved_candidate)
 }
 
+/// Resolves a validation program while blocking shell entrypoints that could
+/// escape the worktree-oriented execution model.
 pub(crate) async fn resolve_validation_program(
     sandbox: &SandboxPolicy,
     working_dir: &Path,
@@ -184,6 +198,7 @@ pub(crate) async fn resolve_validation_program(
     Ok(PathBuf::from(program))
 }
 
+/// Returns true for shell entrypoints that validation commands must not use.
 pub(crate) fn is_disallowed_validation_program(program: &str) -> bool {
     matches!(
         validation_program_name(program).as_str(),
@@ -199,6 +214,7 @@ pub(crate) fn is_disallowed_validation_program(program: &str) -> bool {
     )
 }
 
+/// Normalizes a validation program into its executable file name.
 pub(crate) fn validation_program_name(program: &str) -> String {
     Path::new(program)
         .file_name()
@@ -208,6 +224,7 @@ pub(crate) fn validation_program_name(program: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Builds the job artifact payload used when sandbox policy blocks a command.
 pub(crate) fn sandbox_blocked_report(
     kind: &str,
     argv: &[String],
@@ -227,10 +244,12 @@ pub(crate) fn sandbox_blocked_report(
     })
 }
 
+/// Wraps a sandbox policy violation in a recognizable error prefix.
 pub(crate) fn sandbox_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::anyhow!("{SANDBOX_ERROR_PREFIX}{}", message.into())
 }
 
+/// Maps an error into the lifecycle failure class reported back to the API.
 pub(crate) fn classify_failure(error: &anyhow::Error) -> (String, String) {
     let detail = error.to_string();
     if let Some(stripped) = detail.strip_prefix(SANDBOX_ERROR_PREFIX) {

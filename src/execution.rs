@@ -25,6 +25,7 @@ use crate::{
     },
 };
 
+/// Summary of one execution or approval command path written back into job artifacts.
 struct CommandOutcome {
     detail: String,
     result: String,
@@ -35,6 +36,7 @@ struct CommandOutcome {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Commit metadata captured after a mutating run produces a new commit.
 struct CommitRecord {
     sha: String,
     short_sha: String,
@@ -42,6 +44,7 @@ struct CommitRecord {
     changed_files: Vec<String>,
 }
 
+/// Snapshot of post-run git status used in execution reports.
 struct GitReport {
     status_lines: Vec<String>,
     diff_stat: Option<String>,
@@ -49,29 +52,34 @@ struct GitReport {
 }
 
 #[derive(Debug, Deserialize, Default)]
+/// Minimal subset of repo-local assistant config read by the edge runtime.
 struct AssistantConfig {
     #[serde(default)]
     validation: ValidationConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
+/// Build/test commands resolved from `.assistant/config.toml`.
 struct ValidationConfig {
     build: Option<Vec<String>>,
     test: Option<Vec<String>>,
     working_dir: Option<String>,
 }
 
+/// Resolved validation commands and config source for one job.
 struct ValidationPlan {
     build: Option<CommandSpec>,
     test: Option<CommandSpec>,
     config_source: String,
 }
 
+/// Executable plus working directory for a spawned command.
 struct CommandSpec {
     argv: Vec<String>,
     working_dir: PathBuf,
 }
 
+/// Structured result payload for build and test validation commands.
 struct ValidationResults {
     build: Value,
     test: Value,
@@ -79,6 +87,7 @@ struct ValidationResults {
     config_source: String,
 }
 
+/// Guards single-job execution and emits failure lifecycle events when execution fails.
 pub(crate) async fn handle_job_dispatch(
     dispatch: JobDispatchMessage,
     config: EdgeConfig,

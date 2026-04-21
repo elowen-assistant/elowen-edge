@@ -17,6 +17,7 @@ use crate::{
     registration::{print_trust_keypair, register_device, wait_for_registration},
 };
 
+/// Initializes process-wide tracing before the async runtime starts.
 fn init_tracing(service_name: &'static str, env_overlay: &EnvOverlay) {
     let env_filter = env_value("RUST_LOG", env_overlay)
         .map(tracing_subscriber::EnvFilter::new)
@@ -66,6 +67,8 @@ pub fn run() -> anyhow::Result<()> {
     runtime.block_on(async_main(env_overlay))
 }
 
+/// Builds the runtime dependencies, registers the device, and starts the
+/// long-lived NATS subscriptions for probes, dispatch, and approval messages.
 async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
     let config = crate::config::EdgeConfig::from_env(&env_overlay)?;
     info!(

@@ -61,6 +61,36 @@ Generate trust key material with:
 elowen-edge --generate-trust-keypair
 ```
 
+## Windows Runtime Model
+
+The preferred Windows install path is a Scheduled Task created by
+`scripts/windows/Register-ElowenEdgeTask.ps1`.
+
+That installer now targets a non-interactive scheduled task by default:
+
+- trigger: system startup
+- logon type: `S4U`
+- wrapper mode: supervised `-RunLoop`
+- restart policy: task-level restart plus wrapper-level restart of the SSH tunnel and edge pair
+
+On hosts where Task Scheduler denies `Startup` or `S4U` registration to the current
+session, the installer falls back to a per-user `LogOn + Interactive` task unless
+`-RequireServiceGrade` is supplied. Use `-RequireServiceGrade` when you want the install
+to fail rather than silently accepting the lower-durability fallback.
+
+The older Startup-folder launcher remains available as a fallback for machines where
+Task Scheduler policy or operator permissions prevent the scheduled-task path from being
+used, but it is no longer the primary recommended production model.
+
+The wrapper script supports three main modes:
+
+- foreground: run `elowen-edge` attached to the current terminal
+- detached: launch the tunnel and runtime in the background for local testing
+- supervised: keep the tunnel and runtime under wrapper supervision with automatic restart
+
+For a durable operator install, prefer the scheduled-task path so the wrapper can keep the
+edge and SSH tunnel aligned after startup, reboot, and recoverable failures.
+
 ## Trusted Registration Lifecycle
 
 The edge keeps orchestrator challenge verification strict:
