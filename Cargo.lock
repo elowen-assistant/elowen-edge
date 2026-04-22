@@ -294,6 +294,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elowen-contracts"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "elowen-edge"
 version = "0.1.0"
 dependencies = [
@@ -302,6 +311,7 @@ dependencies = [
  "base64",
  "chrono",
  "ed25519-dalek",
+ "elowen-contracts",
  "futures-util",
  "rand 0.8.5",
  "reqwest",

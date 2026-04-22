@@ -11,6 +11,7 @@ use crate::{
     config::{EdgeConfig, TrustedOrchestratorKey},
     contracts::{
         DeviceRegistrationTrustProof, RegisterDeviceRequest, RegistrationChallengeResponse,
+        RegistrationTrustIntent,
     },
     discovery::{discover_repositories, discover_repository_catalog},
 };
@@ -195,9 +196,9 @@ async fn build_registration_trust_proof(
         edge_public_key,
         edge_signature: URL_SAFE_NO_PAD.encode(edge_signature.to_bytes()),
         registration_intent: if previous_edge_signing_key.is_some() {
-            "rotate".to_string()
+            RegistrationTrustIntent::Rotate
         } else {
-            "enroll".to_string()
+            RegistrationTrustIntent::Enroll
         },
         previous_edge_public_key: reenrollment
             .as_ref()
@@ -382,7 +383,9 @@ mod tests {
     };
     use crate::{
         config::TrustedOrchestratorKey,
-        contracts::{DeviceRegistrationTrustProof, RegistrationChallengeResponse},
+        contracts::{
+            DeviceRegistrationTrustProof, RegistrationChallengeResponse, RegistrationTrustIntent,
+        },
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::Utc;
@@ -413,6 +416,7 @@ mod tests {
             issued_at: Utc::now(),
             orchestrator_key_id: Some("next".to_string()),
             orchestrator_public_key: URL_SAFE_NO_PAD.encode(next.verifying_key().to_bytes()),
+            trusted_signers: Vec::new(),
             signature: "signature".to_string(),
         };
 
@@ -440,6 +444,7 @@ mod tests {
             issued_at: Utc::now(),
             orchestrator_key_id: Some("next".to_string()),
             orchestrator_public_key: URL_SAFE_NO_PAD.encode(unknown.verifying_key().to_bytes()),
+            trusted_signers: Vec::new(),
             signature: "signature".to_string(),
         };
 
@@ -466,6 +471,7 @@ mod tests {
             issued_at: Utc::now(),
             orchestrator_key_id: Some("orchestrator-1-current".to_string()),
             orchestrator_public_key: URL_SAFE_NO_PAD.encode(current.verifying_key().to_bytes()),
+            trusted_signers: Vec::new(),
             signature: "signature".to_string(),
         };
 
@@ -521,7 +527,7 @@ mod tests {
             edge_public_key: current_public_key.clone(),
             edge_signature: URL_SAFE_NO_PAD
                 .encode(current.sign(current_payload.as_bytes()).to_bytes()),
-            registration_intent: "rotate".to_string(),
+            registration_intent: RegistrationTrustIntent::Rotate,
             previous_edge_public_key: Some(previous_public_key.clone()),
             previous_edge_signature: Some(
                 URL_SAFE_NO_PAD.encode(previous.sign(previous_payload.as_bytes()).to_bytes()),
