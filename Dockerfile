@@ -1,9 +1,10 @@
 FROM rust:1.88-bookworm AS build
-WORKDIR /app
+WORKDIR /app/elowen-edge
 
-COPY Cargo.toml Cargo.toml
-COPY Cargo.lock Cargo.lock
-COPY src src
+COPY elowen-edge/Cargo.toml Cargo.toml
+COPY elowen-edge/Cargo.lock Cargo.lock
+COPY elowen-edge/src src
+COPY elowen-platform/contracts/rust/elowen-contracts ../elowen-platform/contracts/rust/elowen-contracts
 
 RUN cargo build --release
 
@@ -14,6 +15,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /app/target/release/elowen-edge /usr/local/bin/elowen-edge
+COPY --from=build /app/elowen-edge/target/release/elowen-edge /usr/local/bin/elowen-edge
 
 CMD ["elowen-edge"]

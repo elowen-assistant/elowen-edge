@@ -164,7 +164,48 @@ pub(crate) async fn enforce_worktree_containment(
         )));
     }
 
-    Ok(resolved_candidate)
+    Ok(normalize_runtime_path(resolved_candidate))
+}
+
+fn normalize_runtime_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix_component)) = components.next() else {
+            return path;
+        };
+
+        match prefix_component.kind() {
+            Prefix::VerbatimDisk(drive) => {
+                let mut normalized = String::new();
+                normalized.push(char::from(drive));
+                normalized.push(':');
+                for component in components {
+                    normalized.push('\\');
+                    normalized.push_str(&component.as_os_str().to_string_lossy());
+                }
+                PathBuf::from(normalized)
+            }
+            Prefix::VerbatimUNC(server, share) => {
+                let mut normalized = String::from(r"\\");
+                normalized.push_str(&server.to_string_lossy());
+                normalized.push('\\');
+                normalized.push_str(&share.to_string_lossy());
+                for component in components {
+                    normalized.push('\\');
+                    normalized.push_str(&component.as_os_str().to_string_lossy());
+                }
+                PathBuf::from(normalized)
+            }
+            _ => path,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
 }
 
 /// Resolves a validation program while blocking shell entrypoints that could
@@ -256,5 +297,26 @@ pub(crate) fn classify_failure(error: &anyhow::Error) -> (String, String) {
         ("sandbox".to_string(), stripped.to_string())
     } else {
         ("execution".to_string(), detail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_runtime_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn windows_verbatim_disk_paths_are_normalized_for_runtime_tools() {
+        let input = PathBuf::from(r"\\?\C:\worktree\.elowen-sandbox\cargo-target");
+        let normalized = normalize_runtime_path(input.clone());
+
+        if cfg!(windows) {
+            assert_eq!(
+                normalized,
+                PathBuf::from(r"C:\worktree\.elowen-sandbox\cargo-target")
+            );
+        } else {
+            assert_eq!(normalized, input);
+        }
     }
 }
