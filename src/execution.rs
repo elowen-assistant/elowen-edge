@@ -15,7 +15,9 @@ use tracing::info;
 
 use crate::{
     config::EdgeConfig,
-    contracts::{ExecutionIntent, JobApprovalCommand, JobDispatchMessage, JobLifecycleEvent},
+    contracts::{
+        ExecutionIntent, JobApprovalCommand, JobDispatchMessage, JobLifecycleEvent, JobTargetKind,
+    },
     discovery::resolve_repo_root,
     events::publish_job_event,
     sandbox::{
@@ -177,7 +179,8 @@ async fn run_job_execution(
             worktree_path: None,
             detail: Some("edge accepted dispatched job".to_string()),
             payload_json: Some(json!({
-                "repo_name": dispatch.repo_name,
+                "target_kind": dispatch.target_kind,
+                "target_name": dispatch.target_name(),
                 "branch_name": dispatch.branch_name,
                 "base_branch": dispatch.base_branch,
             })),
@@ -186,30 +189,35 @@ async fn run_job_execution(
     )
     .await?;
 
-    let worktree_path = create_worktree(dispatch, config).await?;
-    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    let execution_path = create_execution_workspace(dispatch, config).await?;
+    let execution_path_str = execution_path.to_string_lossy().to_string();
+    let reported_path = matches!(dispatch.target_kind, JobTargetKind::Repository)
+        .then_some(execution_path_str.clone());
 
-    publish_job_event(
-        nats,
-        JobLifecycleEvent {
-            job_id: dispatch.job_id.clone(),
-            correlation_id: dispatch.correlation_id.clone(),
-            device_id: config.device_id.clone(),
-            event_type: "job.worktree_created".to_string(),
-            status: Some("accepted".to_string()),
-            result: None,
-            failure_class: None,
-            worktree_path: Some(worktree_path_str.clone()),
-            detail: Some("git worktree created for dispatched job".to_string()),
-            payload_json: Some(json!({
-                "repo_name": dispatch.repo_name,
-                "branch_name": dispatch.branch_name,
-                "base_branch": dispatch.base_branch,
-            })),
-            created_at: Utc::now(),
-        },
-    )
-    .await?;
+    if matches!(dispatch.target_kind, JobTargetKind::Repository) {
+        publish_job_event(
+            nats,
+            JobLifecycleEvent {
+                job_id: dispatch.job_id.clone(),
+                correlation_id: dispatch.correlation_id.clone(),
+                device_id: config.device_id.clone(),
+                event_type: "job.worktree_created".to_string(),
+                status: Some("accepted".to_string()),
+                result: None,
+                failure_class: None,
+                worktree_path: reported_path.clone(),
+                detail: Some("git worktree created for dispatched job".to_string()),
+                payload_json: Some(json!({
+                    "target_kind": dispatch.target_kind,
+                    "target_name": dispatch.target_name(),
+                    "branch_name": dispatch.branch_name,
+                    "base_branch": dispatch.base_branch,
+                })),
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+    }
 
     publish_job_event(
         nats,
@@ -221,7 +229,7 @@ async fn run_job_execution(
             status: Some("running".to_string()),
             result: None,
             failure_class: None,
-            worktree_path: Some(worktree_path_str.clone()),
+            worktree_path: reported_path.clone(),
             detail: Some("job execution started".to_string()),
             payload_json: None,
             created_at: Utc::now(),
@@ -229,7 +237,7 @@ async fn run_job_execution(
     )
     .await?;
 
-    let command_outcome = match run_codex_wrapper(dispatch, config, &worktree_path).await {
+    let command_outcome = match run_codex_wrapper(dispatch, config, &execution_path).await {
         Ok(outcome) => outcome,
         Err(error) => {
             let (failure_class, detail) = classify_failure(&error);
@@ -243,7 +251,7 @@ async fn run_job_execution(
                     status: Some("failed".to_string()),
                     result: Some("failure".to_string()),
                     failure_class: Some(failure_class),
-                    worktree_path: Some(worktree_path_str.clone()),
+                    worktree_path: reported_path.clone(),
                     detail: Some(detail),
                     payload_json: None,
                     created_at: Utc::now(),
@@ -264,7 +272,7 @@ async fn run_job_execution(
             status: Some("completed".to_string()),
             result: Some(command_outcome.result.clone()),
             failure_class: command_outcome.failure_class.clone(),
-            worktree_path: Some(worktree_path_str.clone()),
+            worktree_path: reported_path.clone(),
             detail: Some(command_outcome.detail),
             payload_json: Some(json!({
                 "summary_markdown": command_outcome.summary_markdown,
@@ -287,7 +295,7 @@ async fn run_job_execution(
                 status: Some("awaiting_approval".to_string()),
                 result: Some(command_outcome.result),
                 failure_class: command_outcome.failure_class,
-                worktree_path: Some(worktree_path_str),
+                worktree_path: reported_path,
                 detail: Some("push remains gated behind explicit approval".to_string()),
                 payload_json: Some(json!({
                     "action_type": "push",
@@ -373,10 +381,15 @@ async fn run_approved_push(
     config: &EdgeConfig,
     nats: &async_nats::Client,
 ) -> anyhow::Result<()> {
-    let worktree_path = config
-        .worktree_root
-        .join(&command.repo_name)
-        .join(&command.short_id);
+    let repo_name = command
+        .target_name
+        .as_deref()
+        .context("approved push is missing target name")?;
+    let branch_name = command
+        .branch_name
+        .as_deref()
+        .context("approved push is missing branch name")?;
+    let worktree_path = config.worktree_root.join(repo_name).join(&command.short_id);
     let worktree_path = enforce_worktree_containment(
         &config.worktree_root,
         &worktree_path,
@@ -419,15 +432,10 @@ async fn run_approved_push(
         .arg("-C")
         .arg(&worktree_path)
         .args(["push", "-u", "origin"])
-        .arg(&command.branch_name)
+        .arg(branch_name)
         .output()
         .await
-        .with_context(|| {
-            format!(
-                "failed to execute approved push for branch {}",
-                command.branch_name
-            )
-        })?;
+        .with_context(|| format!("failed to execute approved push for branch {}", branch_name))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -435,7 +443,7 @@ async fn run_approved_push(
     if !output.status.success() {
         anyhow::bail!(
             "git push failed for `{}`: {}",
-            command.branch_name,
+            branch_name,
             summarize_process_output(&stdout, &stderr)
         );
     }
@@ -451,10 +459,7 @@ async fn run_approved_push(
             result: Some("success".to_string()),
             failure_class: None,
             worktree_path: Some(worktree_path_str),
-            detail: Some(format!(
-                "pushed branch `{}` to `origin`",
-                command.branch_name
-            )),
+            detail: Some(format!("pushed branch `{}` to `origin`", branch_name)),
             payload_json: Some(json!({
                 "approval_id": command.approval_id,
                 "action_type": command.action_type,
@@ -475,10 +480,19 @@ async fn create_worktree(
     dispatch: &JobDispatchMessage,
     config: &EdgeConfig,
 ) -> anyhow::Result<PathBuf> {
-    let repo_root = resolve_repo_root(config, &dispatch.repo_name)?;
-    ensure_repo_root(&repo_root, &dispatch.repo_name).await?;
+    let repo_name = dispatch.target_name();
+    let branch_name = dispatch
+        .branch_name
+        .as_deref()
+        .context("repository dispatch is missing branch_name")?;
+    let base_branch = dispatch
+        .base_branch
+        .as_deref()
+        .context("repository dispatch is missing base_branch")?;
+    let repo_root = resolve_repo_root(config, repo_name)?;
+    ensure_repo_root(&repo_root, repo_name).await?;
 
-    let worktree_parent = config.worktree_root.join(&dispatch.repo_name);
+    let worktree_parent = config.worktree_root.join(repo_name);
     let worktree_path = worktree_parent.join(&dispatch.short_id);
     fs::create_dir_all(&worktree_parent)
         .await
@@ -504,12 +518,12 @@ async fn create_worktree(
         .arg("-C")
         .arg(&repo_root)
         .args(["worktree", "add", "--force", "-B"])
-        .arg(&dispatch.branch_name)
+        .arg(branch_name)
         .arg(&worktree_path)
-        .arg(&dispatch.base_branch)
+        .arg(base_branch)
         .output()
         .await
-        .with_context(|| format!("failed to create worktree for {}", dispatch.repo_name))?;
+        .with_context(|| format!("failed to create worktree for {}", repo_name))?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -520,6 +534,40 @@ async fn create_worktree(
 
     write_job_request_files(dispatch, &worktree_path).await?;
     Ok(worktree_path)
+}
+
+async fn create_capability_workspace(
+    dispatch: &JobDispatchMessage,
+    config: &EdgeConfig,
+) -> anyhow::Result<PathBuf> {
+    let workspace_parent = config.worktree_root.join("_capability");
+    let workspace_path = workspace_parent.join(&dispatch.short_id);
+    fs::create_dir_all(&workspace_parent)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create capability workspace parent {}",
+                workspace_parent.display()
+            )
+        })?;
+    if fs::metadata(&workspace_path).await.is_ok() {
+        let _ = fs::remove_dir_all(&workspace_path).await;
+    }
+    fs::create_dir_all(&workspace_path)
+        .await
+        .with_context(|| format!("failed to create {}", workspace_path.display()))?;
+    write_job_request_files(dispatch, &workspace_path).await?;
+    Ok(workspace_path)
+}
+
+async fn create_execution_workspace(
+    dispatch: &JobDispatchMessage,
+    config: &EdgeConfig,
+) -> anyhow::Result<PathBuf> {
+    match dispatch.target_kind {
+        JobTargetKind::Repository => create_worktree(dispatch, config).await,
+        JobTargetKind::Capability => create_capability_workspace(dispatch, config).await,
+    }
 }
 
 async fn run_codex_wrapper(
@@ -547,17 +595,19 @@ async fn run_simulated_codex_wrapper(
         "# Simulated Slice 4 Execution\n\n\
         - Job: {}\n\
         - Thread: {}\n\
-        - Repo: {}\n\
+        - Target kind: {}\n\
+        - Target: {}\n\
         - Branch: {}\n\
         - Base branch: {}\n\
         - Runner: simulated\n\n\
         ## Request\n\n{}\n",
         dispatch.job_id,
         dispatch.thread_id,
-        dispatch.repo_name,
-        dispatch.branch_name,
-        dispatch.base_branch,
-        dispatch.request_text
+        dispatch.target_kind.as_str(),
+        dispatch.target_name(),
+        dispatch.branch_name.as_deref().unwrap_or("n/a"),
+        dispatch.base_branch.as_deref().unwrap_or("n/a"),
+        dispatch.prompt
     );
 
     fs::write(&summary_path, summary_body)
@@ -605,15 +655,25 @@ async fn run_codex_cli(
         .env("ELOWEN_JOB_SHORT_ID", &dispatch.short_id)
         .env("ELOWEN_THREAD_ID", &dispatch.thread_id)
         .env("ELOWEN_JOB_TITLE", &dispatch.title)
-        .env("ELOWEN_REPO_NAME", &dispatch.repo_name)
-        .env("ELOWEN_BRANCH_NAME", &dispatch.branch_name)
-        .env("ELOWEN_BASE_BRANCH", &dispatch.base_branch)
         .env("ELOWEN_WORKTREE_PATH", &sandbox.worktree_path)
-        .env("ELOWEN_REQUEST_TEXT", &dispatch.request_text)
+        .env("ELOWEN_REQUEST_TEXT", &dispatch.prompt)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_sandbox_environment(&mut child, sandbox);
+    child.env("ELOWEN_JOB_TARGET_KIND", dispatch.target_kind.as_str());
+    if matches!(dispatch.target_kind, JobTargetKind::Repository) {
+        child.env("ELOWEN_REPO_NAME", dispatch.target_name());
+    }
+    if let Some(branch_name) = dispatch.branch_name.as_deref() {
+        child.env("ELOWEN_BRANCH_NAME", branch_name);
+    }
+    if let Some(base_branch) = dispatch.base_branch.as_deref() {
+        child.env("ELOWEN_BASE_BRANCH", base_branch);
+    }
+    if matches!(dispatch.target_kind, JobTargetKind::Capability) {
+        child.env("ELOWEN_CAPABILITY_NAME", dispatch.target_name());
+    }
     let mut child = child
         .spawn()
         .with_context(|| format!("failed to start Codex CLI `{command}`"))?;
@@ -716,8 +776,17 @@ async fn finalize_command_outcome(
             "validation failed after Codex execution (build: {build_status}, test: {test_status})"
         )
     };
-    let mut git_report = capture_git_report(&sandbox.worktree_path).await?;
-    let commit = if validation.overall_success
+    let mut git_report = if matches!(dispatch.target_kind, JobTargetKind::Repository) {
+        capture_git_report(&sandbox.worktree_path).await?
+    } else {
+        GitReport {
+            status_lines: Vec::new(),
+            diff_stat: None,
+            changed_files: Vec::new(),
+        }
+    };
+    let commit = if matches!(dispatch.target_kind, JobTargetKind::Repository)
+        && validation.overall_success
         && !matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly)
     {
         let commit = maybe_create_job_commit(&sandbox.worktree_path, dispatch, &git_report).await?;
@@ -748,6 +817,8 @@ async fn finalize_command_outcome(
         "execution_intent".to_string(),
         json!(dispatch.execution_intent),
     );
+    execution_report.insert("target_kind".to_string(), json!(dispatch.target_kind));
+    execution_report.insert("target_name".to_string(), json!(dispatch.target_name()));
     execution_report.insert(
         "read_only_change_detected".to_string(),
         json!(
@@ -759,7 +830,9 @@ async fn finalize_command_outcome(
     let execution_report = Value::Object(execution_report);
 
     let detail = if validation.overall_success {
-        if matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly)
+        if matches!(dispatch.target_kind, JobTargetKind::Capability) {
+            format!("{base_detail}; capability execution produced no repository worktree changes")
+        } else if matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly)
             && !git_report.changed_files.is_empty()
         {
             format!(
@@ -771,7 +844,8 @@ async fn finalize_command_outcome(
         } else if let Some(commit) = commit.as_ref() {
             format!(
                 "{base_detail}; created commit {} for branch {}",
-                commit.short_sha, dispatch.branch_name
+                commit.short_sha,
+                dispatch.branch_name.as_deref().unwrap_or("unknown")
             )
         } else {
             format!("{base_detail}; no committed repo changes were detected")
@@ -784,7 +858,8 @@ async fn finalize_command_outcome(
         "# Job Summary\n\n\
         - Result: {result}\n\
         - Runner: {runner}\n\
-        - Repo: {}\n\
+        - Target kind: {}\n\
+        - Target: {}\n\
         - Branch: {}\n\
         - Execution intent: {}\n\
         - Validation config: {}\n\n\
@@ -797,11 +872,12 @@ async fn finalize_command_outcome(
         ## Workspace Changes\n\n\
         - Changed entries: {}\n\
         - Diff stat: {}\n",
-        dispatch.repo_name,
-        dispatch.branch_name,
+        dispatch.target_kind.as_str(),
+        dispatch.target_name(),
+        dispatch.branch_name.as_deref().unwrap_or("n/a"),
         dispatch.execution_intent.as_str(),
         validation.config_source,
-        dispatch.request_text,
+        dispatch.prompt,
         git_report.changed_files.len(),
         git_report
             .diff_stat
@@ -812,14 +888,16 @@ async fn finalize_command_outcome(
             .map(|commit| format!("`{}` ({})", commit.short_sha, commit.message))
             .unwrap_or_else(|| "none".to_string()),
     );
-    let approval_summary = if matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly) {
+    let approval_summary = if matches!(dispatch.target_kind, JobTargetKind::Capability)
+        || matches!(dispatch.execution_intent, ExecutionIntent::ReadOnly)
+    {
         None
     } else {
         commit.as_ref().map(|commit| {
             format!(
                 "Approve push for `{}` on branch `{}` with commit `{}` after reviewing the generated summary, validation output, and {} changed entries.",
-                dispatch.repo_name,
-                dispatch.branch_name,
+                dispatch.target_name(),
+                dispatch.branch_name.as_deref().unwrap_or("unknown"),
                 commit.short_sha,
                 git_report.changed_files.len(),
             )
@@ -850,18 +928,20 @@ async fn write_job_request_files(
             "# Elowen Job Request\n\n\
             - Job: {}\n\
             - Thread: {}\n\
-            - Repo: {}\n\
+            - Target kind: {}\n\
+            - Target: {}\n\
             - Branch: {}\n\
             - Base branch: {}\n\n\
             - Execution intent: {}\n\n\
             ## Requested Work\n\n{}\n",
             dispatch.job_id,
             dispatch.thread_id,
-            dispatch.repo_name,
-            dispatch.branch_name,
-            dispatch.base_branch,
+            dispatch.target_kind.as_str(),
+            dispatch.target_name(),
+            dispatch.branch_name.as_deref().unwrap_or("n/a"),
+            dispatch.base_branch.as_deref().unwrap_or("n/a"),
             dispatch.execution_intent.as_str(),
-            dispatch.request_text
+            dispatch.prompt
         ) + &format!("\n## Execution Guidance\n\n{}\n", intent_guidance),
     )
     .await
@@ -872,11 +952,13 @@ async fn write_job_request_files(
         "short_id": dispatch.short_id,
         "thread_id": dispatch.thread_id,
         "title": dispatch.title,
-        "repo_name": dispatch.repo_name,
+        "target_kind": dispatch.target_kind,
+        "target_name": dispatch.target_name(),
+        "target_name": dispatch.target_name(),
         "base_branch": dispatch.base_branch,
         "branch_name": dispatch.branch_name,
         "execution_intent": dispatch.execution_intent,
-        "request_text": dispatch.request_text,
+        "prompt": dispatch.prompt,
         "dispatched_at": dispatch.dispatched_at,
     }))
     .context("failed to serialize job metadata")?;
@@ -894,10 +976,10 @@ async fn write_job_request_files(
 fn execution_intent_guidance(intent: &ExecutionIntent) -> &'static str {
     match intent {
         ExecutionIntent::WorkspaceChange => {
-            "Make the requested repository changes, summarize what changed, and leave the worktree ready for commit and approval if durable changes are needed."
+            "Carry out the requested work, summarize what changed, and leave any execution artifacts ready for review."
         }
         ExecutionIntent::ReadOnly => {
-            "Inspect and report only. Do not create durable repository changes, do not create commits, and do not ask for push approval. If a tool leaves tracked changes behind, leave them uncommitted in the disposable worktree and call that out in the result."
+            "Inspect and report only. Do not create durable repository changes, do not create commits, and do not ask for push approval. If execution leaves local artifacts behind, call that out in the result."
         }
     }
 }

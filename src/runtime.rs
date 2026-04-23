@@ -149,8 +149,9 @@ async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
                 job_id = %dispatch.job_id,
                 correlation_id = %dispatch.correlation_id,
                 short_id = %dispatch.short_id,
-                repo_name = %dispatch.repo_name,
-                branch_name = %dispatch.branch_name,
+                target_kind = %dispatch.target_kind.as_str(),
+                target_name = %dispatch.target_name(),
+                branch_name = %dispatch.branch_name.as_deref().unwrap_or("n/a"),
                 "received job dispatch"
             );
             let dispatch_job_id = dispatch.job_id.clone();
@@ -200,8 +201,9 @@ async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
                 job_id = %command.job_id,
                 correlation_id = %command.correlation_id,
                 approval_id = %command.approval_id,
-                repo_name = %command.repo_name,
-                branch_name = %command.branch_name,
+                target_kind = %command.target_kind.as_str(),
+                target_name = %command.target_name(),
+                branch_name = %command.branch_name.as_deref().unwrap_or("n/a"),
                 "received approval command"
             );
 

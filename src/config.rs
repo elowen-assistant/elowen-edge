@@ -122,7 +122,7 @@ impl EdgeConfig {
             excluded_repo_paths,
             capabilities: parse_list_env(
                 "ELOWEN_DEVICE_CAPABILITIES",
-                &["codex", "git", "build", "test"],
+                &["codex", "git", "build", "test", "generic_jobs"],
                 env_overlay,
             ),
             workspace_root,

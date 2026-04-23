@@ -2,6 +2,6 @@
 
 pub(crate) use elowen_contracts::{
     AvailabilityProbeMessage, AvailabilitySnapshot, DeviceRegistrationTrustProof, DeviceRepository,
-    ExecutionIntent, JobApprovalCommand, JobDispatchMessage, JobLifecycleEvent,
+    ExecutionIntent, JobApprovalCommand, JobDispatchMessage, JobLifecycleEvent, JobTargetKind,
     RegisterDeviceRequest, RegistrationChallengeResponse, RegistrationTrustIntent,
 };
