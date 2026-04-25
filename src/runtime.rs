@@ -9,27 +9,28 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::{
-    config::{EnvOverlay, env_value, load_env_overlay, parse_startup_options},
+    config::{EdgeCommand, EdgeConfig, parse_command},
     contracts::{
         AvailabilityProbeMessage, AvailabilitySnapshot, JobApprovalCommand, JobDispatchMessage,
     },
     execution::{handle_job_approval, handle_job_dispatch, preflight_codex_runner},
     registration::{print_trust_keypair, register_device, wait_for_registration},
+    status::{EdgeStatus, write_status},
 };
 
 /// Initializes process-wide tracing before the async runtime starts.
-fn init_tracing(service_name: &'static str, env_overlay: &EnvOverlay) {
-    let env_filter = env_value("RUST_LOG", env_overlay)
+fn init_tracing(service_name: &'static str, config: &EdgeConfig) {
+    let env_filter = config
+        .rust_log
+        .clone()
         .map(tracing_subscriber::EnvFilter::new)
         .or_else(|| tracing_subscriber::EnvFilter::try_from_default_env().ok())
         .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
-    let log_format =
-        env_value("ELOWEN_LOG_FORMAT", env_overlay).unwrap_or_else(|| "plain".to_string());
     let builder = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(true);
 
-    if log_format.eq_ignore_ascii_case("json") {
+    if config.log_format.eq_ignore_ascii_case("json") {
         builder
             .json()
             .with_current_span(false)
@@ -41,36 +42,39 @@ fn init_tracing(service_name: &'static str, env_overlay: &EnvOverlay) {
         builder.with_ansi(true).init();
     }
 
-    info!(service = service_name, log_format = %log_format, "tracing initialized");
+    info!(service = service_name, log_format = %config.log_format, "tracing initialized");
 }
 
 /// Starts the edge runtime.
 pub fn run() -> anyhow::Result<()> {
-    let startup = parse_startup_options()?;
-    if startup.generate_trust_keypair {
-        print_trust_keypair();
-        return Ok(());
+    match parse_command()? {
+        EdgeCommand::Run { config_path } => {
+            let config = EdgeConfig::load(&config_path)?;
+            init_tracing("elowen-edge", &config);
+            info!(path = %config.config_path.display(), "loaded edge TOML config");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            runtime.block_on(async_main(config))
+        }
+        EdgeCommand::Tui { config_path } => crate::tui::run(config_path),
+        EdgeCommand::ImportEnv {
+            env_file,
+            config_path,
+        } => crate::config::import_env_file(&env_file, &config_path),
+        EdgeCommand::GenerateTrustKeypair => {
+            print_trust_keypair();
+            Ok(())
+        }
     }
-
-    let env_overlay = load_env_overlay(startup.env_file.as_deref())?;
-    init_tracing("elowen-edge", &env_overlay);
-
-    if let Some(env_file) = startup.env_file.as_ref() {
-        info!(path = %env_file.display(), "loaded edge env file");
-    }
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime")?;
-
-    runtime.block_on(async_main(env_overlay))
 }
 
 /// Builds the runtime dependencies, registers the device, and starts the
 /// long-lived NATS subscriptions for probes, dispatch, and approval messages.
-async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
-    let config = crate::config::EdgeConfig::from_env(&env_overlay)?;
+async fn async_main(config: EdgeConfig) -> anyhow::Result<()> {
+    let mut status = EdgeStatus::new(&config);
+    write_status(&config.status_path, &status).await?;
     info!(
         sandbox_mode = %config.sandbox_mode.as_str(),
         "edge sandbox mode configured"
@@ -82,23 +86,36 @@ async fn async_main(env_overlay: EnvOverlay) -> anyhow::Result<()> {
     let nats = async_nats::connect(&config.nats_url)
         .await
         .context("failed to connect to NATS")?;
+    status.mark_nats("connected");
+    write_status(&config.status_path, &status).await?;
     let active_job_id = Arc::new(Mutex::new(None::<String>));
 
     wait_for_registration(&http, &config).await;
+    status.mark_registration_success();
+    write_status(&config.status_path, &status).await?;
     info!(device_id = %config.device_id, "registered edge device");
 
     let heartbeat_http = http.clone();
     let heartbeat_config = config.clone();
+    let heartbeat_status_path = config.status_path.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        let mut heartbeat_status = EdgeStatus::new(&heartbeat_config);
+        heartbeat_status.mark_nats("connected");
 
         loop {
             ticker.tick().await;
             match register_device(&heartbeat_http, &heartbeat_config).await {
                 Ok(()) => {
+                    heartbeat_status.mark_registration_success();
+                    let _ = write_status(&heartbeat_status_path, &heartbeat_status).await;
                     info!(device_id = %heartbeat_config.device_id, "edge registration heartbeat")
                 }
-                Err(error) => warn!(error = %error, "edge registration heartbeat failed"),
+                Err(error) => {
+                    heartbeat_status.mark_registration_error(error.to_string());
+                    let _ = write_status(&heartbeat_status_path, &heartbeat_status).await;
+                    warn!(error = %error, "edge registration heartbeat failed")
+                }
             }
         }
     });

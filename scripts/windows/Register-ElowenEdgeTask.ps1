@@ -1,9 +1,10 @@
 [CmdletBinding()]
 param(
     [string]$TaskName = "ElowenEdge",
-    [string]$EnvFile,
+    [string]$ConfigFile,
     [string]$TunnelUser,
     [string]$TunnelHost,
+    [string]$BinaryPath,
     [switch]$Release,
     [switch]$SkipTunnel,
     [ValidateSet("Startup", "LogOn")]
@@ -24,13 +25,15 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $startScript = Join-Path $PSScriptRoot "Start-ElowenEdge.ps1"
 
-if (-not $EnvFile) {
-    $EnvFile = Join-Path $repoRoot "edge.env.local"
+if (-not $ConfigFile) {
+    $ConfigFile = Join-Path $repoRoot "edge.toml"
 }
 
-if (-not (Test-Path -LiteralPath $EnvFile)) {
-    throw "Edge env file not found: $EnvFile"
+if (-not (Test-Path -LiteralPath $ConfigFile)) {
+    throw "Edge TOML config not found: $ConfigFile"
 }
+
+$ConfigFile = (Resolve-Path -LiteralPath $ConfigFile).Path
 
 if (-not $SkipTunnel -and (-not $TunnelUser -or -not $TunnelHost)) {
     throw "TunnelUser and TunnelHost are required unless -SkipTunnel is set."
@@ -74,17 +77,47 @@ function Get-TaskRegistrationErrorMessage {
     return $Exception.Message
 }
 
+function ConvertTo-VbScriptString {
+    param([string]$Value)
+
+    '"' + $Value.Replace('"', '""') + '"'
+}
+
+function Write-HiddenPowerShellLauncher {
+    param(
+        [string]$LauncherPath,
+        [string]$PowerShellArguments,
+        [string]$WorkingDirectory
+    )
+
+    $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (-not (Test-Path -LiteralPath $powerShellPath)) {
+        $powerShellPath = "powershell.exe"
+    }
+
+    $command = (Quote-TaskArgument $powerShellPath) + " " + $PowerShellArguments
+    $launcher = @(
+        'Set shell = CreateObject("WScript.Shell")'
+        ('shell.CurrentDirectory = ' + (ConvertTo-VbScriptString $WorkingDirectory))
+        ('exitCode = shell.Run(' + (ConvertTo-VbScriptString $command) + ', 0, True)')
+        'WScript.Quit exitCode'
+    ) -join "`r`n"
+
+    Set-Content -LiteralPath $LauncherPath -Value $launcher -Encoding ASCII
+}
+
 function Register-WithPlan {
     param(
         [string]$Name,
         [string]$Description,
+        [string]$TaskExecutable,
         [string]$TaskArguments,
         [string]$SelectedUserId,
         [pscustomobject]$Plan
     )
 
     $action = New-ScheduledTaskAction `
-        -Execute "powershell.exe" `
+        -Execute $TaskExecutable `
         -Argument $TaskArguments
 
     $triggerObject = if ($Plan.Trigger -eq "Startup") {
@@ -119,16 +152,24 @@ function Register-WithPlan {
 
 $argumentParts = @(
     "-NoProfile"
+    "-WindowStyle"
+    "Hidden"
     "-ExecutionPolicy"
     "Bypass"
     "-File"
     (Quote-TaskArgument $startScript)
-    "-EnvFile"
-    (Quote-TaskArgument $EnvFile)
+    "-ConfigFile"
+    (Quote-TaskArgument $ConfigFile)
     "-RunLoop"
     "-RestartDelaySeconds"
     $RestartDelaySeconds.ToString()
 )
+
+if ($BinaryPath) {
+    $BinaryPath = (Resolve-Path -LiteralPath $BinaryPath).Path
+    $argumentParts += "-BinaryPath"
+    $argumentParts += (Quote-TaskArgument $BinaryPath)
+}
 
 if ($Release) {
     $argumentParts += "-Release"
@@ -149,6 +190,13 @@ if ($LogDirectory) {
 }
 
 $taskArguments = $argumentParts -join " "
+$launcherPath = Join-Path $PSScriptRoot "$TaskName.launcher.vbs"
+Write-HiddenPowerShellLauncher `
+    -LauncherPath $launcherPath `
+    -PowerShellArguments $taskArguments `
+    -WorkingDirectory $repoRoot
+$taskExecutable = "wscript.exe"
+$taskArguments = Quote-TaskArgument $launcherPath
 $description = "Starts the Elowen laptop edge wrapper with a $Trigger scheduled task using $LogonType logon semantics."
 $requestedPlan = New-TaskRegistrationPlan -PlanTrigger $Trigger -PlanLogonType $LogonType -PlanRunLevel $RunLevel -PlanUserId $UserId
 $selectedPlan = $requestedPlan
@@ -159,6 +207,7 @@ try {
     Register-WithPlan `
         -Name $TaskName `
         -Description $description `
+        -TaskExecutable $taskExecutable `
         -TaskArguments $taskArguments `
         -SelectedUserId $UserId `
         -Plan $selectedPlan
@@ -189,6 +238,7 @@ catch {
     Register-WithPlan `
         -Name $TaskName `
         -Description $description `
+        -TaskExecutable $taskExecutable `
         -TaskArguments $taskArguments `
         -SelectedUserId $UserId `
         -Plan $selectedPlan
@@ -200,5 +250,7 @@ Write-Host "Requested logon type: $LogonType"
 Write-Host "Effective trigger: $($selectedPlan.Trigger)"
 Write-Host "Effective user: $($selectedPlan.UserId)"
 Write-Host "Effective logon type: $($selectedPlan.LogonType)"
+Write-Host "Task executable: $taskExecutable"
+Write-Host "Hidden launcher: $launcherPath"
 Write-Host "PowerShell session elevated: $isElevated"
 Write-Host "Start it now with: Start-ScheduledTask -TaskName $TaskName"

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$EnvFile,
+    [string]$ConfigFile,
     [string]$TunnelUser,
     [string]$TunnelHost,
     [int]$TunnelLocalPort = 4222,
@@ -18,13 +18,15 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
-if (-not $EnvFile) {
-    $EnvFile = Join-Path $repoRoot "edge.env.local"
+if (-not $ConfigFile) {
+    $ConfigFile = Join-Path $repoRoot "edge.toml"
 }
 
-if (-not (Test-Path -LiteralPath $EnvFile)) {
-    throw "Edge env file not found: $EnvFile"
+if (-not (Test-Path -LiteralPath $ConfigFile)) {
+    throw "Edge TOML config not found: $ConfigFile"
 }
+
+$ConfigFile = (Resolve-Path -LiteralPath $ConfigFile).Path
 
 if (-not $BinaryPath) {
     $profile = if ($Release) { "release" } else { "debug" }
@@ -159,7 +161,7 @@ function Invoke-EdgePair {
         Start-Sleep -Seconds 2
     }
 
-    $edgeArgs = @("--env-file", $EnvFile)
+    $edgeArgs = @("run", "--config", $ConfigFile)
     $edgeProcess = Start-ManagedProcess `
         -Name "elowen-edge" `
         -FilePath $BinaryPath `
@@ -260,7 +262,7 @@ if (-not $SkipTunnel) {
     Start-Sleep -Seconds 2
 }
 
-$edgeArgs = @("--env-file", $EnvFile)
+$edgeArgs = @("run", "--config", $ConfigFile)
 
 if ($Detach) {
     $detachedLogDirectory = Resolve-WrapperLogDirectory

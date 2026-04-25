@@ -17,4 +17,4 @@ RUN apt-get update \
 
 COPY --from=build /app/elowen-edge/target/release/elowen-edge /usr/local/bin/elowen-edge
 
-CMD ["elowen-edge"]
+CMD ["elowen-edge", "--help"]

@@ -1,0 +1,49 @@
+name: Build Edge Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "elowen-edge-v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target.label }}
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: linux-x64
+            runner: ubuntu-latest
+            artifact: elowen-edge-linux-x64
+            binary: target/release/elowen-edge
+          - label: windows-x64
+            runner: windows-latest
+            artifact: elowen-edge-windows-x64
+            binary: target/release/elowen-edge.exe
+
+    steps:
+      - name: Checkout elowen-edge
+        uses: actions/checkout@v5
+        with:
+          path: elowen-edge
+
+      - name: Checkout elowen-platform contracts
+        uses: actions/checkout@v5
+        with:
+          repository: elowen-assistant/elowen-platform
+          path: elowen-platform
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        working-directory: elowen-edge
+        run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target.artifact }}
+          path: elowen-edge/${{ matrix.target.binary }}

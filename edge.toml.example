@@ -1,0 +1,45 @@
+[orchestrator]
+api_url = "https://api.ericburden.dev"
+nats_url = "nats://127.0.0.1:4222"
+
+[device]
+id = "elowen-laptop"
+name = "Elowen Laptop"
+primary = true
+capabilities = ["codex", "git", "build", "test", "generic_jobs"]
+
+[repositories]
+workspace_root = "D:\\Projects\\elowen"
+worktree_root = "D:\\Projects\\elowen\\.elowen\\worktrees"
+allowed_roots = ["D:\\Projects"]
+allowed_repos = ["elowen-api"]
+hidden_repos = []
+excluded_paths = []
+
+[runtime]
+state_dir = "D:\\Projects\\elowen\\.elowen\\edge-state"
+log_format = "json"
+rust_log = "info"
+
+[runner]
+codex_command = "codex"
+codex_args = ["--model", "gpt-5.4"]
+simulated_run_ms = 1500
+validation_timeout_secs = 600
+sandbox_mode = "workspace"
+
+[trust]
+orchestrator_keys_path = "secrets\\orchestrator-trust.json"
+edge_signing_key_path = "secrets\\edge-signing-key.txt"
+# previous_edge_signing_key_path = "secrets\\previous-edge-signing-key.txt"
+
+[service]
+name = "elowen-edge"
+log_dir = "D:\\Projects\\elowen\\.elowen\\edge-logs"
+
+[tunnel]
+enabled = true
+user = "vps-user"
+host = "api.ericburden.dev"
+local_port = 4222
+remote_port = 4222
