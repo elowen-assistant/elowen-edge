@@ -6,6 +6,8 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
 use reqwest::Client as HttpClient;
+use serde::Deserialize;
+use std::fmt;
 
 use crate::{
     config::{EdgeConfig, TrustedOrchestratorKey},
@@ -29,19 +31,6 @@ pub(crate) fn print_trust_keypair() {
             "public_key": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
         })
     );
-}
-
-/// Retries initial device registration until the edge is trusted and visible.
-pub(crate) async fn wait_for_registration(http: &HttpClient, config: &EdgeConfig) {
-    loop {
-        match register_device(http, config).await {
-            Ok(()) => return,
-            Err(error) => {
-                tracing::warn!(error = %error, "initial device registration failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-    }
 }
 
 /// Publishes the current device registration payload to the orchestrator API.
@@ -85,10 +74,59 @@ pub(crate) async fn register_device(http: &HttpClient, config: &EdgeConfig) -> a
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("device registration failed with status {status}: {body}");
+        let api_error = serde_json::from_str::<ApiErrorResponse>(&body).ok();
+        let message = api_error
+            .as_ref()
+            .map(|error| error.error.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(body);
+        return Err(RegistrationError {
+            status: status.as_u16(),
+            message,
+            code: api_error.and_then(|error| error.code),
+        }
+        .into());
     }
 
     Ok(())
+}
+
+pub(crate) fn registration_error_code(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<RegistrationError>()
+        .and_then(|error| error.code.as_deref())
+}
+
+#[derive(Debug)]
+struct RegistrationError {
+    status: u16,
+    message: String,
+    code: Option<String>,
+}
+
+impl fmt::Display for RegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.code.as_deref() {
+            Some(code) => write!(
+                formatter,
+                "device registration failed with status {} ({code}): {}",
+                self.status, self.message
+            ),
+            None => write!(
+                formatter,
+                "device registration failed with status {}: {}",
+                self.status, self.message
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegistrationError {}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorResponse {
+    error: String,
+    code: Option<String>,
 }
 
 async fn build_registration_trust_proof(

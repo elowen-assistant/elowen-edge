@@ -22,6 +22,7 @@ use std::{
 
 use crate::{
     config::{EdgeConfig, EdgeConfigFile},
+    contracts::RegistrationChallengeResponse,
     execution::{discover_codex_command, preflight_codex_runner},
     service::{self, ServiceAction},
     status::{EdgeStatus, read_status},
@@ -296,6 +297,10 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &TuiModel, area: ratatui::layout
                     "Last registration: {}",
                     format_last_registration(status.as_ref())
                 )),
+                ListItem::new(format!(
+                    "Trust: {}",
+                    format_trust_status(config, status.as_ref())
+                )),
             ]
         }
         Err(error) => vec![ListItem::new(format!("Config error: {error}"))],
@@ -304,6 +309,33 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &TuiModel, area: ratatui::layout
         List::new(items).block(Block::default().title("Edge Health").borders(Borders::ALL)),
         area,
     );
+}
+
+fn format_trust_status(config: &EdgeConfig, status: Option<&EdgeStatus>) -> String {
+    if let Some(error_code) =
+        status.and_then(|status| status.last_registration_error_code.as_deref())
+    {
+        return format!("{error_code} - {}", trust_failure_guidance(error_code));
+    }
+    let signer_summary = config
+        .trusted_orchestrator_keys
+        .iter()
+        .map(|key| {
+            key.key_id
+                .clone()
+                .unwrap_or_else(|| short_fingerprint(&key.public_key))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{} trusted signer(s){}",
+        config.trusted_orchestrator_keys.len(),
+        if signer_summary.is_empty() {
+            String::new()
+        } else {
+            format!(": {signer_summary}")
+        }
+    )
 }
 
 fn format_last_registration(status: Option<&EdgeStatus>) -> String {
@@ -400,15 +432,7 @@ fn first_run_checks(model: &TuiModel) -> Vec<ReadinessCheck> {
             label: "Trust material",
             ok: has_trust(model),
             detail: match &model.config {
-                Ok(config) => format!(
-                    "{} trusted orchestrator key(s), edge signing key {}",
-                    config.trusted_orchestrator_keys.len(),
-                    if config.edge_signing_key.is_some() {
-                        "loaded"
-                    } else {
-                        "missing"
-                    }
-                ),
+                Ok(config) => trust_readiness_detail(config),
                 Err(_) => "config must parse before trust files can be checked".to_string(),
             },
             action: "create the trust files and set [trust].orchestrator_keys_path and [trust].edge_signing_key_path",
@@ -497,7 +521,9 @@ fn draw_diagnostics(frame: &mut Frame<'_>, model: &TuiModel, area: ratatui::layo
                 discover_codex_diagnostic()
             };
             format!(
-                "Config parses successfully.\nSecret files passed permission checks.\n{}\n\nPress a to auto-discover and save the Codex command.\nNATS/API checks run when the service starts; see the dashboard status file after startup.",
+                "Config parses successfully.\n{}\n{}\n{}\n\nPress a to auto-discover and save the Codex command.\nNATS/API checks run when the service starts; see the dashboard status file after startup.",
+                trust_diagnostics(config),
+                run_trust_challenge_check(config),
                 codex
             )
         }
@@ -509,6 +535,155 @@ fn draw_diagnostics(frame: &mut Frame<'_>, model: &TuiModel, area: ratatui::layo
             .block(Block::default().title("Diagnostics").borders(Borders::ALL)),
         area,
     );
+}
+
+fn trust_readiness_detail(config: &EdgeConfig) -> String {
+    let trust_bundle = config
+        .orchestrator_keys_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not configured".to_string());
+    let edge_key = config
+        .edge_signing_key_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not configured".to_string());
+    let previous_key = if config.previous_edge_signing_key_path.is_some() {
+        "previous key configured for rotation; confirm rotation in orchestrator admin UI"
+    } else {
+        "no previous key configured"
+    };
+    format!(
+        "{} trusted signer(s); trust bundle {}; edge key {}; {}",
+        config.trusted_orchestrator_keys.len(),
+        trust_bundle,
+        edge_key,
+        previous_key
+    )
+}
+
+fn trust_diagnostics(config: &EdgeConfig) -> String {
+    let signer_lines = config
+        .trusted_orchestrator_keys
+        .iter()
+        .map(|key| {
+            format!(
+                "- {} ({})",
+                key.key_id.as_deref().unwrap_or("public-key-only"),
+                short_fingerprint(&key.public_key)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let previous = if config.previous_edge_signing_key.is_some() {
+        "Previous edge signing key is loaded. Use this only during key rotation, then confirm rotation in the orchestrator admin UI and remove the previous key path."
+    } else {
+        "Previous edge signing key is not configured. That is expected unless this device is rotating its edge key."
+    };
+    format!(
+        "Trust files passed permission checks.\nTrusted orchestrator signers:\n{}\n{}",
+        if signer_lines.is_empty() {
+            "- none configured".to_string()
+        } else {
+            signer_lines
+        },
+        previous
+    )
+}
+
+fn run_trust_challenge_check(config: &EdgeConfig) -> String {
+    if config.trusted_orchestrator_keys.is_empty() {
+        return "Trust challenge check skipped: no trusted orchestrator keys configured."
+            .to_string();
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return format!("Trust challenge check could not start: {error}"),
+    };
+    match runtime.block_on(fetch_registration_challenge(config)) {
+        Ok(challenge) => {
+            let matched = config.trusted_orchestrator_keys.iter().any(|key| {
+                key.public_key.trim() == challenge.orchestrator_public_key.trim()
+                    && challenge
+                        .orchestrator_key_id
+                        .as_deref()
+                        .map(|challenge_key_id| {
+                            key.key_id
+                                .as_deref()
+                                .map(|configured_key_id| configured_key_id == challenge_key_id)
+                                .unwrap_or(true)
+                        })
+                        .unwrap_or(true)
+            });
+            if matched {
+                format!(
+                    "Trust challenge check passed: orchestrator signer {} ({}) is trusted.",
+                    challenge
+                        .orchestrator_key_id
+                        .as_deref()
+                        .unwrap_or("public-key-only"),
+                    short_fingerprint(&challenge.orchestrator_public_key)
+                )
+            } else {
+                format!(
+                    "Trust challenge check failed: orchestrator advertised signer {} ({}), which is not in the local trust bundle. Update orchestrator-trust.json.",
+                    challenge
+                        .orchestrator_key_id
+                        .as_deref()
+                        .unwrap_or("public-key-only"),
+                    short_fingerprint(&challenge.orchestrator_public_key)
+                )
+            }
+        }
+        Err(error) => format!("Trust challenge check failed: {error}"),
+    }
+}
+
+async fn fetch_registration_challenge(
+    config: &EdgeConfig,
+) -> anyhow::Result<RegistrationChallengeResponse> {
+    let response = reqwest::get(format!(
+        "{}/api/v1/trust/registration-challenge",
+        config.api_url
+    ))
+    .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("challenge endpoint returned {}", response.status());
+    }
+    Ok(response.json::<RegistrationChallengeResponse>().await?)
+}
+
+fn trust_failure_guidance(code: &str) -> &'static str {
+    match code {
+        "device_trust_revoked" | "edge_key_revoked" => {
+            "stop this edge identity; clear revocation or re-enroll with fresh trust material in orchestrator admin UI"
+        }
+        "orchestrator_signer_retired" | "orchestrator_signer_untrusted" => {
+            "update orchestrator-trust.json with the active signer bundle"
+        }
+        "rotation_previous_key_mismatch" | "rotation_previous_signature_invalid" => {
+            "restore the previous edge key path during rotation, then confirm rotation in orchestrator admin UI"
+        }
+        "rotation_previous_key_incomplete" => {
+            "set both previous edge public key and previous signature by configuring previous_edge_signing_key_path"
+        }
+        "trusted_registration_required" => {
+            "configure trust bundle and edge signing key paths before starting the service"
+        }
+        _ => "review trust files, orchestrator signer state, and network connectivity",
+    }
+}
+
+fn short_fingerprint(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= 16 {
+        trimmed.to_string()
+    } else {
+        format!("{}...{}", &trimmed[..8], &trimmed[trimmed.len() - 8..])
+    }
 }
 
 fn discover_codex_diagnostic() -> String {
@@ -657,6 +832,7 @@ mod tests {
             nats_status: "connected".to_string(),
             last_registration_at: Some(Utc.with_ymd_and_hms(2026, 4, 25, 2, 49, 39).unwrap()),
             last_registration_error: None,
+            last_registration_error_code: None,
             service_status: None,
         };
 
