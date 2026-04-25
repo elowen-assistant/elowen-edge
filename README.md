@@ -183,6 +183,17 @@ Recommended operator setup:
 4. During edge signing-key rotation, set `[trust].previous_edge_signing_key_path` only for the re-enrollment window.
 5. After the API confirms the new edge key is trusted, remove the previous key path.
 
+Slice 42 trust lifecycle support makes the orchestrator authoritative for
+dispatch eligibility. A device in `rotated`, `revoked`, `untrusted`, or
+`needs_attention` state will not receive jobs until an admin resolves it in the
+orchestrator UI. The TUI reads the local status file and shows structured
+registration failure guidance when the API reports trust errors:
+
+- `device_trust_revoked` or `edge_key_revoked`: stop this edge identity and use the orchestrator admin UI to clear revocation or re-enroll with fresh key material.
+- `orchestrator_signer_retired` or `orchestrator_signer_untrusted`: update `orchestrator-trust.json` with the active signer bundle.
+- `rotation_previous_key_mismatch` or `rotation_previous_signature_invalid`: restore `[trust].previous_edge_signing_key_path` during the rotation window, then confirm rotation in the orchestrator admin UI.
+- `trusted_registration_required`: configure the trust bundle and edge signing key paths before starting the service.
+
 ## Local Verification
 
 ```bash

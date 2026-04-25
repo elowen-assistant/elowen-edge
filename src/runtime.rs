@@ -14,7 +14,7 @@ use crate::{
         AvailabilityProbeMessage, AvailabilitySnapshot, JobApprovalCommand, JobDispatchMessage,
     },
     execution::{handle_job_approval, handle_job_dispatch, preflight_codex_runner},
-    registration::{print_trust_keypair, register_device, wait_for_registration},
+    registration::{print_trust_keypair, register_device},
     status::{EdgeStatus, write_status},
 };
 
@@ -90,7 +90,20 @@ async fn async_main(config: EdgeConfig) -> anyhow::Result<()> {
     write_status(&config.status_path, &status).await?;
     let active_job_id = Arc::new(Mutex::new(None::<String>));
 
-    wait_for_registration(&http, &config).await;
+    loop {
+        match register_device(&http, &config).await {
+            Ok(()) => break,
+            Err(error) => {
+                status.mark_registration_error(
+                    error.to_string(),
+                    crate::registration::registration_error_code(&error).map(str::to_string),
+                );
+                write_status(&config.status_path, &status).await?;
+                warn!(error = %error, "initial device registration failed; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
     status.mark_registration_success();
     write_status(&config.status_path, &status).await?;
     info!(device_id = %config.device_id, "registered edge device");
@@ -112,7 +125,10 @@ async fn async_main(config: EdgeConfig) -> anyhow::Result<()> {
                     info!(device_id = %heartbeat_config.device_id, "edge registration heartbeat")
                 }
                 Err(error) => {
-                    heartbeat_status.mark_registration_error(error.to_string());
+                    heartbeat_status.mark_registration_error(
+                        error.to_string(),
+                        crate::registration::registration_error_code(&error).map(str::to_string),
+                    );
                     let _ = write_status(&heartbeat_status_path, &heartbeat_status).await;
                     warn!(error = %error, "edge registration heartbeat failed")
                 }

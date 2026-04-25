@@ -19,6 +19,8 @@ pub(crate) struct EdgeStatus {
     pub(crate) nats_status: String,
     pub(crate) last_registration_at: Option<DateTime<Utc>>,
     pub(crate) last_registration_error: Option<String>,
+    #[serde(default)]
+    pub(crate) last_registration_error_code: Option<String>,
     pub(crate) service_status: Option<String>,
 }
 
@@ -39,6 +41,7 @@ impl EdgeStatus {
             nats_status: "starting".to_string(),
             last_registration_at: None,
             last_registration_error: None,
+            last_registration_error_code: None,
             service_status: None,
         }
     }
@@ -51,11 +54,17 @@ impl EdgeStatus {
     pub(crate) fn mark_registration_success(&mut self) {
         self.last_registration_at = Some(Utc::now());
         self.last_registration_error = None;
+        self.last_registration_error_code = None;
         self.updated_at = Utc::now();
     }
 
-    pub(crate) fn mark_registration_error(&mut self, error: impl Into<String>) {
+    pub(crate) fn mark_registration_error(
+        &mut self,
+        error: impl Into<String>,
+        code: Option<String>,
+    ) {
         self.last_registration_error = Some(error.into());
+        self.last_registration_error_code = code;
         self.updated_at = Utc::now();
     }
 }

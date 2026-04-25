@@ -75,10 +75,16 @@ pub(crate) struct EdgeConfig {
     pub(crate) sandbox_mode: SandboxMode,
     /// Orchestrator keys pinned locally for trusted registration.
     pub(crate) trusted_orchestrator_keys: Vec<TrustedOrchestratorKey>,
+    /// Path to the configured orchestrator trust bundle.
+    pub(crate) orchestrator_keys_path: Option<PathBuf>,
     /// Current edge signing key used for trusted registration.
     pub(crate) edge_signing_key: Option<String>,
+    /// Path to the configured current edge signing key.
+    pub(crate) edge_signing_key_path: Option<PathBuf>,
     /// Previous edge signing key used during trusted re-enrollment.
     pub(crate) previous_edge_signing_key: Option<String>,
+    /// Path to the configured previous edge signing key.
+    pub(crate) previous_edge_signing_key_path: Option<PathBuf>,
     /// Local state directory for status and runtime artifacts.
     pub(crate) state_dir: PathBuf,
     /// Local JSON status file path.
@@ -224,6 +230,24 @@ impl EdgeConfig {
             Some(path) => resolve_path(config_dir, path)?,
             None => workspace_root.join(".elowen").join("edge-state"),
         };
+        let orchestrator_keys_path = file
+            .trust
+            .orchestrator_keys_path
+            .as_ref()
+            .map(|path| resolve_path(config_dir, path.clone()))
+            .transpose()?;
+        let edge_signing_key_path = file
+            .trust
+            .edge_signing_key_path
+            .as_ref()
+            .map(|path| resolve_path(config_dir, path.clone()))
+            .transpose()?;
+        let previous_edge_signing_key_path = file
+            .trust
+            .previous_edge_signing_key_path
+            .as_ref()
+            .map(|path| resolve_path(config_dir, path.clone()))
+            .transpose()?;
 
         Ok(Self {
             config_path: config_path.to_path_buf(),
@@ -252,11 +276,14 @@ impl EdgeConfig {
                 config_dir,
                 file.trust.orchestrator_keys_path.as_deref(),
             )?,
+            orchestrator_keys_path,
             edge_signing_key: load_secret(config_dir, file.trust.edge_signing_key_path.as_deref())?,
+            edge_signing_key_path,
             previous_edge_signing_key: load_secret(
                 config_dir,
                 file.trust.previous_edge_signing_key_path.as_deref(),
             )?,
+            previous_edge_signing_key_path,
             status_path: state_dir.join("status.json"),
             state_dir,
             service_name: default_service_name(file.service.name),
@@ -534,7 +561,7 @@ fn load_trusted_orchestrator_keys(
         return Ok(Vec::new());
     };
     let path = resolve_path(base, path.to_path_buf())?;
-    warn_if_secret_permissions_are_broad(&path)?;
+    let _ = stdfs::metadata(&path)?;
     let body = stdfs::read_to_string(&path)
         .with_context(|| format!("failed to read trust bundle {}", path.display()))?;
     let parsed: Vec<TrustedOrchestratorKey> = serde_json::from_str(&body)
@@ -553,6 +580,18 @@ fn load_trusted_orchestrator_keys(
 #[cfg(unix)]
 fn warn_if_secret_permissions_are_broad(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    if env::var("ELOWEN_EDGE_ALLOW_BROAD_SECRET_PERMISSIONS")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+    {
+        let _ = stdfs::metadata(path)?;
+        return Ok(());
+    }
     let mode = stdfs::metadata(path)?.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         anyhow::bail!(
