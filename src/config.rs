@@ -1,6 +1,7 @@
-//! Runtime configuration and startup parsing.
+//! TOML runtime configuration, command-line parsing, and legacy env import.
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env, fs as stdfs,
@@ -9,20 +10,35 @@ use std::{
 
 use crate::{SandboxMode, detect_device_id, detect_device_name, parse_bool};
 
-/// Overlay of environment variables loaded from an env file.
-pub(crate) type EnvOverlay = HashMap<String, String>;
+const DEFAULT_CAPABILITIES: &[&str] = &["codex", "git", "build", "test", "generic_jobs"];
+const DEFAULT_REPOS: &[&str] = &[
+    "elowen-api",
+    "elowen-ui",
+    "elowen-edge",
+    "elowen-notes",
+    "elowen-platform",
+];
 
-/// Startup-only command-line options.
-pub(crate) struct StartupOptions {
-    /// Optional env file loaded before runtime config parsing.
-    pub(crate) env_file: Option<PathBuf>,
-    /// Prints a new trust keypair and exits without starting the runtime.
-    pub(crate) generate_trust_keypair: bool,
+/// Top-level command selected at process startup.
+pub(crate) enum EdgeCommand {
+    Run {
+        config_path: PathBuf,
+    },
+    Tui {
+        config_path: PathBuf,
+    },
+    ImportEnv {
+        env_file: PathBuf,
+        config_path: PathBuf,
+    },
+    GenerateTrustKeypair,
 }
 
-/// Configuration required by the edge runtime after startup parsing.
+/// Configuration required by the edge runtime after TOML parsing.
 #[derive(Clone)]
 pub(crate) struct EdgeConfig {
+    /// Path to the loaded TOML config file.
+    pub(crate) config_path: PathBuf,
     /// Base URL for the orchestrator API.
     pub(crate) api_url: String,
     /// NATS connection string used for probes, dispatch, and events.
@@ -63,130 +79,528 @@ pub(crate) struct EdgeConfig {
     pub(crate) edge_signing_key: Option<String>,
     /// Previous edge signing key used during trusted re-enrollment.
     pub(crate) previous_edge_signing_key: Option<String>,
+    /// Local state directory for status and runtime artifacts.
+    pub(crate) state_dir: PathBuf,
+    /// Local JSON status file path.
+    pub(crate) status_path: PathBuf,
+    /// Platform service name used by local service-manager integrations.
+    pub(crate) service_name: String,
+    /// Log format used by tracing.
+    pub(crate) log_format: String,
+    /// Optional tracing filter.
+    pub(crate) rust_log: Option<String>,
 }
 
 /// Trusted orchestrator signing key accepted for challenge verification.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TrustedOrchestratorKey {
     pub(crate) key_id: Option<String>,
     pub(crate) public_key: String,
 }
 
+/// Parsed TOML file before runtime defaults are resolved.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct EdgeConfigFile {
+    pub(crate) orchestrator: OrchestratorSection,
+    pub(crate) device: DeviceSection,
+    pub(crate) repositories: RepositorySection,
+    pub(crate) runtime: RuntimeSection,
+    pub(crate) runner: RunnerSection,
+    pub(crate) trust: TrustSection,
+    pub(crate) service: ServiceSection,
+    pub(crate) tunnel: TunnelSection,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct OrchestratorSection {
+    pub(crate) api_url: Option<String>,
+    pub(crate) nats_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct DeviceSection {
+    pub(crate) id: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) primary: Option<bool>,
+    pub(crate) capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct RepositorySection {
+    pub(crate) workspace_root: Option<PathBuf>,
+    pub(crate) worktree_root: Option<PathBuf>,
+    pub(crate) allowed_roots: Vec<PathBuf>,
+    pub(crate) allowed_repos: Vec<String>,
+    pub(crate) hidden_repos: Vec<String>,
+    pub(crate) excluded_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct RuntimeSection {
+    pub(crate) state_dir: Option<PathBuf>,
+    pub(crate) log_format: Option<String>,
+    pub(crate) rust_log: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct RunnerSection {
+    pub(crate) codex_command: Option<String>,
+    pub(crate) codex_args: Vec<String>,
+    pub(crate) simulated_run_ms: Option<u64>,
+    pub(crate) validation_timeout_secs: Option<u64>,
+    pub(crate) sandbox_mode: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct TrustSection {
+    pub(crate) orchestrator_keys_path: Option<PathBuf>,
+    pub(crate) edge_signing_key_path: Option<PathBuf>,
+    pub(crate) previous_edge_signing_key_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct ServiceSection {
+    pub(crate) name: Option<String>,
+    pub(crate) log_dir: Option<PathBuf>,
+    pub(crate) run_as_user: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct TunnelSection {
+    pub(crate) enabled: bool,
+    pub(crate) user: Option<String>,
+    pub(crate) host: Option<String>,
+    pub(crate) local_port: Option<u16>,
+    pub(crate) remote_port: Option<u16>,
+}
+
 impl EdgeConfig {
-    /// Loads the runtime config from the environment and env-file overlay.
-    pub(crate) fn from_env(env_overlay: &EnvOverlay) -> anyhow::Result<Self> {
-        let device_id = env_value("ELOWEN_DEVICE_ID", env_overlay).unwrap_or_else(detect_device_id);
-        let device_name = env_value("ELOWEN_DEVICE_NAME", env_overlay)
-            .unwrap_or_else(|| detect_device_name(&device_id));
-        let workspace_root = PathBuf::from(
-            env_value("ELOWEN_EDGE_WORKSPACE_ROOT", env_overlay)
-                .unwrap_or_else(|| "/workspace".to_string()),
-        );
-        let worktree_root = env_value("ELOWEN_EDGE_WORKTREE_ROOT", env_overlay)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| workspace_root.join(".elowen").join("worktrees"));
+    /// Loads and validates the runtime config from a TOML file.
+    pub(crate) fn load(config_path: &Path) -> anyhow::Result<Self> {
+        let contents = stdfs::read_to_string(config_path)
+            .with_context(|| format!("failed to read config {}", config_path.display()))?;
+        let file: EdgeConfigFile = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse config {}", config_path.display()))?;
+        Self::from_file(config_path, file)
+    }
+
+    pub(crate) fn from_file(config_path: &Path, file: EdgeConfigFile) -> anyhow::Result<Self> {
+        let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+        let device_id = trimmed(file.device.id).unwrap_or_else(detect_device_id);
+        let device_name =
+            trimmed(file.device.name).unwrap_or_else(|| detect_device_name(&device_id));
+        let workspace_root =
+            resolve_path_or_default(config_dir, file.repositories.workspace_root, "/workspace")?;
+        let worktree_root = match file.repositories.worktree_root {
+            Some(path) => resolve_path(config_dir, path)?,
+            None => workspace_root.join(".elowen").join("worktrees"),
+        };
         let allowed_repo_roots =
-            parse_repo_root_env("ELOWEN_ALLOWED_REPO_ROOTS", &workspace_root, env_overlay)?;
-        let excluded_repo_paths = parse_repo_policy_path_env(
-            "ELOWEN_REPO_SCAN_EXCLUDE_PATHS",
-            &workspace_root,
+            resolve_existing_dirs(config_dir, file.repositories.allowed_roots)?;
+        let excluded_repo_paths = resolve_policy_paths(
+            config_dir,
+            file.repositories.excluded_paths,
             &allowed_repo_roots,
-            env_overlay,
         )?;
+        let allowed_repos =
+            if file.repositories.allowed_repos.is_empty() && allowed_repo_roots.is_empty() {
+                DEFAULT_REPOS
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect()
+            } else {
+                unique_strings(file.repositories.allowed_repos)
+            };
+        let state_dir = match file.runtime.state_dir {
+            Some(path) => resolve_path(config_dir, path)?,
+            None => workspace_root.join(".elowen").join("edge-state"),
+        };
 
         Ok(Self {
-            api_url: env_value("ELOWEN_API_URL", env_overlay)
+            config_path: config_path.to_path_buf(),
+            api_url: trimmed(file.orchestrator.api_url)
                 .unwrap_or_else(|| "http://elowen-api:8080".to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            nats_url: env_value("ELOWEN_NATS_URL", env_overlay)
-                .context("missing ELOWEN_NATS_URL")?,
+            nats_url: trimmed(file.orchestrator.nats_url)
+                .context("missing orchestrator.nats_url")?,
             device_id,
             device_name,
-            primary_flag: env_value("ELOWEN_DEVICE_PRIMARY", env_overlay)
-                .map(|value| parse_bool(&value))
-                .unwrap_or(true),
-            allowed_repos: parse_allowed_repos_env(
-                &[
-                    "elowen-api",
-                    "elowen-ui",
-                    "elowen-edge",
-                    "elowen-notes",
-                    "elowen-platform",
-                ],
-                &allowed_repo_roots,
-                env_overlay,
-            ),
+            primary_flag: file.device.primary.unwrap_or(true),
+            allowed_repos,
             allowed_repo_roots,
-            hidden_repos: parse_list_env("ELOWEN_HIDDEN_REPOS", &[], env_overlay),
+            hidden_repos: unique_strings(file.repositories.hidden_repos),
             excluded_repo_paths,
-            capabilities: parse_list_env(
-                "ELOWEN_DEVICE_CAPABILITIES",
-                &["codex", "git", "build", "test", "generic_jobs"],
-                env_overlay,
-            ),
+            capabilities: defaulted_strings(file.device.capabilities, DEFAULT_CAPABILITIES),
             workspace_root,
             worktree_root,
-            codex_command: env_value("ELOWEN_CODEX_COMMAND", env_overlay),
-            codex_args: parse_json_list_env("ELOWEN_CODEX_ARGS_JSON", env_overlay)?,
-            simulated_run_ms: env_value("ELOWEN_SIMULATED_RUN_MS", env_overlay)
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(1500),
-            validation_timeout_secs: env_value("ELOWEN_VALIDATION_TIMEOUT_SECS", env_overlay)
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(600),
-            sandbox_mode: SandboxMode::from_env(
-                env_value("ELOWEN_SANDBOX_MODE", env_overlay).as_deref(),
+            codex_command: trimmed(file.runner.codex_command),
+            codex_args: file.runner.codex_args,
+            simulated_run_ms: file.runner.simulated_run_ms.unwrap_or(1500),
+            validation_timeout_secs: file.runner.validation_timeout_secs.unwrap_or(600),
+            sandbox_mode: SandboxMode::from_env(file.runner.sandbox_mode.as_deref())?,
+            trusted_orchestrator_keys: load_trusted_orchestrator_keys(
+                config_dir,
+                file.trust.orchestrator_keys_path.as_deref(),
             )?,
-            trusted_orchestrator_keys: parse_trusted_orchestrator_keys(env_overlay)?,
-            edge_signing_key: env_value("ELOWEN_EDGE_SIGNING_KEY", env_overlay),
-            previous_edge_signing_key: env_value("ELOWEN_PREVIOUS_EDGE_SIGNING_KEY", env_overlay),
+            edge_signing_key: load_secret(config_dir, file.trust.edge_signing_key_path.as_deref())?,
+            previous_edge_signing_key: load_secret(
+                config_dir,
+                file.trust.previous_edge_signing_key_path.as_deref(),
+            )?,
+            status_path: state_dir.join("status.json"),
+            state_dir,
+            service_name: default_service_name(file.service.name),
+            log_format: file
+                .runtime
+                .log_format
+                .unwrap_or_else(|| "plain".to_string()),
+            rust_log: trimmed(file.runtime.rust_log),
         })
     }
 }
 
-/// Parses CLI startup arguments.
-pub(crate) fn parse_startup_options() -> anyhow::Result<StartupOptions> {
-    let mut env_file = None;
-    let mut generate_trust_keypair = false;
-    let mut args = env::args().skip(1);
+/// Parses the top-level edge CLI.
+pub(crate) fn parse_command() -> anyhow::Result<EdgeCommand> {
+    let mut args = env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        anyhow::bail!("{}", startup_usage());
+    }
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--generate-trust-keypair" => {
-                generate_trust_keypair = true;
-            }
-            "--env-file" => {
-                let value = args.next().context("missing value after --env-file")?;
-                env_file = Some(PathBuf::from(value));
-            }
-            "--help" | "-h" => {
-                print!("{}", startup_usage());
-                std::process::exit(0);
-            }
-            _ => anyhow::bail!("unsupported argument `{arg}`\n\n{}", startup_usage()),
+    if matches!(args[0].as_str(), "--help" | "-h") {
+        print!("{}", startup_usage());
+        std::process::exit(0);
+    }
+
+    if args[0] == "--generate-trust-keypair" {
+        return Ok(EdgeCommand::GenerateTrustKeypair);
+    }
+
+    let command = args.remove(0);
+    match command.as_str() {
+        "run" => Ok(EdgeCommand::Run {
+            config_path: take_path_arg(&mut args, "--config")?,
+        }),
+        "tui" => Ok(EdgeCommand::Tui {
+            config_path: take_path_arg(&mut args, "--config")?,
+        }),
+        "trust" if args.first().map(String::as_str) == Some("generate-keypair") => {
+            Ok(EdgeCommand::GenerateTrustKeypair)
         }
+        "config" if args.first().map(String::as_str) == Some("import-env") => {
+            args.remove(0);
+            Ok(EdgeCommand::ImportEnv {
+                env_file: take_path_arg(&mut args, "--env-file")?,
+                config_path: take_path_arg(&mut args, "--config")?,
+            })
+        }
+        _ => anyhow::bail!("unsupported command `{command}`\n\n{}", startup_usage()),
     }
-
-    if env_file.is_none() {
-        env_file = env::var("ELOWEN_EDGE_ENV_FILE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from);
-    }
-
-    Ok(StartupOptions {
-        env_file,
-        generate_trust_keypair,
-    })
 }
 
-/// Loads optional env-file values while letting the process environment win.
-pub(crate) fn load_env_overlay(env_file: Option<&Path>) -> anyhow::Result<EnvOverlay> {
-    let Some(env_file) = env_file else {
-        return Ok(EnvOverlay::new());
+/// Converts a legacy env file into the Slice 41 TOML shape.
+pub(crate) fn import_env_file(env_file: &Path, config_path: &Path) -> anyhow::Result<()> {
+    let overlay = load_env_overlay(env_file)?;
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let secret_dir = config_dir.join("secrets");
+    stdfs::create_dir_all(&secret_dir)
+        .with_context(|| format!("failed to create {}", secret_dir.display()))?;
+
+    let trust = import_trust_files(&overlay, &secret_dir)?;
+    let file = EdgeConfigFile {
+        orchestrator: OrchestratorSection {
+            api_url: overlay.get("ELOWEN_API_URL").cloned(),
+            nats_url: overlay.get("ELOWEN_NATS_URL").cloned(),
+        },
+        device: DeviceSection {
+            id: overlay.get("ELOWEN_DEVICE_ID").cloned(),
+            name: overlay.get("ELOWEN_DEVICE_NAME").cloned(),
+            primary: overlay
+                .get("ELOWEN_DEVICE_PRIMARY")
+                .map(|value| parse_bool(value)),
+            capabilities: overlay
+                .get("ELOWEN_DEVICE_CAPABILITIES")
+                .map(|value| parse_list_value(value))
+                .unwrap_or_default(),
+        },
+        repositories: RepositorySection {
+            workspace_root: overlay.get("ELOWEN_EDGE_WORKSPACE_ROOT").map(PathBuf::from),
+            worktree_root: overlay.get("ELOWEN_EDGE_WORKTREE_ROOT").map(PathBuf::from),
+            allowed_roots: overlay
+                .get("ELOWEN_ALLOWED_REPO_ROOTS")
+                .map(|value| parse_paths_value(value))
+                .unwrap_or_default(),
+            allowed_repos: overlay
+                .get("ELOWEN_ALLOWED_REPOS")
+                .map(|value| parse_list_value(value))
+                .unwrap_or_default(),
+            hidden_repos: overlay
+                .get("ELOWEN_HIDDEN_REPOS")
+                .map(|value| parse_list_value(value))
+                .unwrap_or_default(),
+            excluded_paths: overlay
+                .get("ELOWEN_REPO_SCAN_EXCLUDE_PATHS")
+                .map(|value| parse_paths_value(value))
+                .unwrap_or_default(),
+        },
+        runtime: RuntimeSection {
+            state_dir: None,
+            log_format: overlay.get("ELOWEN_LOG_FORMAT").cloned(),
+            rust_log: overlay.get("RUST_LOG").cloned(),
+        },
+        runner: RunnerSection {
+            codex_command: overlay.get("ELOWEN_CODEX_COMMAND").cloned(),
+            codex_args: overlay
+                .get("ELOWEN_CODEX_ARGS_JSON")
+                .map(|value| serde_json::from_str(value))
+                .transpose()
+                .context("failed to parse ELOWEN_CODEX_ARGS_JSON")?
+                .unwrap_or_default(),
+            simulated_run_ms: overlay
+                .get("ELOWEN_SIMULATED_RUN_MS")
+                .and_then(|value| value.parse().ok()),
+            validation_timeout_secs: overlay
+                .get("ELOWEN_VALIDATION_TIMEOUT_SECS")
+                .and_then(|value| value.parse().ok()),
+            sandbox_mode: overlay.get("ELOWEN_SANDBOX_MODE").cloned(),
+        },
+        trust,
+        service: ServiceSection::default(),
+        tunnel: TunnelSection::default(),
     };
 
+    let body = toml::to_string_pretty(&file).context("failed to serialize TOML config")?;
+    stdfs::write(config_path, body)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(())
+}
+
+fn import_trust_files(overlay: &EnvOverlay, secret_dir: &Path) -> anyhow::Result<TrustSection> {
+    let mut trust = TrustSection::default();
+
+    if let Some(value) = overlay.get("ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON") {
+        let path = secret_dir.join("orchestrator-trust.json");
+        stdfs::write(&path, value)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        trust.orchestrator_keys_path = Some(path);
+    } else if let Some(value) = overlay
+        .get("ELOWEN_ORCHESTRATOR_PUBLIC_KEYS")
+        .or_else(|| overlay.get("ELOWEN_ORCHESTRATOR_PUBLIC_KEY"))
+    {
+        let keys = parse_list_value(value)
+            .into_iter()
+            .map(|public_key| TrustedOrchestratorKey {
+                key_id: None,
+                public_key,
+            })
+            .collect::<Vec<_>>();
+        let path = secret_dir.join("orchestrator-trust.json");
+        let body = serde_json::to_string_pretty(&keys)?;
+        stdfs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
+        trust.orchestrator_keys_path = Some(path);
+    }
+
+    if let Some(value) = overlay.get("ELOWEN_EDGE_SIGNING_KEY") {
+        let path = secret_dir.join("edge-signing-key.txt");
+        stdfs::write(&path, value)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        trust.edge_signing_key_path = Some(path);
+    }
+
+    if let Some(value) = overlay.get("ELOWEN_PREVIOUS_EDGE_SIGNING_KEY") {
+        let path = secret_dir.join("previous-edge-signing-key.txt");
+        stdfs::write(&path, value)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        trust.previous_edge_signing_key_path = Some(path);
+    }
+
+    Ok(trust)
+}
+
+fn take_path_arg(args: &mut Vec<String>, name: &str) -> anyhow::Result<PathBuf> {
+    let Some(index) = args.iter().position(|arg| arg == name) else {
+        anyhow::bail!("missing required {name}\n\n{}", startup_usage());
+    };
+    if index + 1 >= args.len() {
+        anyhow::bail!("missing value after {name}");
+    }
+    let value = args.remove(index + 1);
+    args.remove(index);
+    Ok(PathBuf::from(value))
+}
+
+fn startup_usage() -> &'static str {
+    "Usage:\n\
+  elowen-edge run --config PATH\n\
+  elowen-edge tui --config PATH\n\
+  elowen-edge config import-env --env-file PATH --config PATH\n\
+  elowen-edge trust generate-keypair\n\n\
+TOML config is required for runtime startup. Legacy env files are supported only by import-env.\n"
+}
+
+fn resolve_path_or_default(
+    base: &Path,
+    path: Option<PathBuf>,
+    default: &str,
+) -> anyhow::Result<PathBuf> {
+    resolve_path(base, path.unwrap_or_else(|| PathBuf::from(default)))
+}
+
+pub(crate) fn resolve_path(base: &Path, path: PathBuf) -> anyhow::Result<PathBuf> {
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    Ok(resolved)
+}
+
+fn resolve_existing_dirs(base: &Path, paths: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    for path in paths {
+        let canonical = stdfs::canonicalize(resolve_path(base, path)?)
+            .context("failed to resolve repository root")?;
+        if !canonical.is_dir() {
+            anyhow::bail!(
+                "configured repository root {} is not a directory",
+                canonical.display()
+            );
+        }
+        if !resolved.iter().any(|existing| existing == &canonical) {
+            resolved.push(canonical);
+        }
+    }
+    Ok(resolved)
+}
+
+fn resolve_policy_paths(
+    base: &Path,
+    paths: Vec<PathBuf>,
+    allowed_roots: &[PathBuf],
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    for path in paths {
+        let canonical = stdfs::canonicalize(resolve_path(base, path)?)
+            .context("failed to resolve repository policy path")?;
+        if !canonical.exists() {
+            anyhow::bail!(
+                "configured repository policy path {} does not exist",
+                canonical.display()
+            );
+        }
+        if !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+            anyhow::bail!(
+                "configured repository policy path {} is outside the trusted repository roots",
+                canonical.display()
+            );
+        }
+        if !resolved.iter().any(|existing| existing == &canonical) {
+            resolved.push(canonical);
+        }
+    }
+    Ok(resolved)
+}
+
+fn load_secret(base: &Path, path: Option<&Path>) -> anyhow::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = resolve_path(base, path.to_path_buf())?;
+    warn_if_secret_permissions_are_broad(&path)?;
+    let value = stdfs::read_to_string(&path)
+        .with_context(|| format!("failed to read secret file {}", path.display()))?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        anyhow::bail!("secret file {} is empty", path.display());
+    }
+    Ok(Some(value))
+}
+
+fn load_trusted_orchestrator_keys(
+    base: &Path,
+    path: Option<&Path>,
+) -> anyhow::Result<Vec<TrustedOrchestratorKey>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let path = resolve_path(base, path.to_path_buf())?;
+    warn_if_secret_permissions_are_broad(&path)?;
+    let body = stdfs::read_to_string(&path)
+        .with_context(|| format!("failed to read trust bundle {}", path.display()))?;
+    let parsed: Vec<TrustedOrchestratorKey> = serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse trust bundle {}", path.display()))?;
+    for key in &parsed {
+        if key.public_key.trim().is_empty() {
+            anyhow::bail!(
+                "trust bundle {} contains an empty public key",
+                path.display()
+            );
+        }
+    }
+    Ok(parsed)
+}
+
+#[cfg(unix)]
+fn warn_if_secret_permissions_are_broad(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = stdfs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "secret file {} is readable by group/other; restrict it to the service user",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn warn_if_secret_permissions_are_broad(path: &Path) -> anyhow::Result<()> {
+    let _ = stdfs::metadata(path)?;
+    Ok(())
+}
+
+fn trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn defaulted_strings(values: Vec<String>, default: &[&str]) -> Vec<String> {
+    if values.is_empty() {
+        return default.iter().map(|value| value.to_string()).collect();
+    }
+    unique_strings(values)
+}
+
+fn unique_strings(values: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || unique.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        unique.push(trimmed.to_string());
+    }
+    unique
+}
+
+fn default_service_name(value: Option<String>) -> String {
+    trimmed(value).unwrap_or_else(|| "elowen-edge".to_string())
+}
+
+type EnvOverlay = HashMap<String, String>;
+
+fn load_env_overlay(env_file: &Path) -> anyhow::Result<EnvOverlay> {
     let contents = stdfs::read_to_string(env_file)
         .with_context(|| format!("failed to read env file {}", env_file.display()))?;
     let mut env_overlay = EnvOverlay::new();
@@ -221,245 +635,6 @@ pub(crate) fn load_env_overlay(env_file: Option<&Path>) -> anyhow::Result<EnvOve
     Ok(env_overlay)
 }
 
-/// Returns a trimmed config value, preferring the env file overlay over the
-/// inherited process environment.
-pub(crate) fn env_value(key: &str, env_overlay: &EnvOverlay) -> Option<String> {
-    env_overlay
-        .get(key)
-        .cloned()
-        .or_else(|| env::var(key).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn parse_list_env(key: &str, default: &[&str], env_overlay: &EnvOverlay) -> Vec<String> {
-    let value = env_value(key, env_overlay).unwrap_or_else(|| default.join(","));
-    parse_list_value(&value)
-}
-
-fn parse_allowed_repos_env(
-    default: &[&str],
-    allowed_repo_roots: &[PathBuf],
-    env_overlay: &EnvOverlay,
-) -> Vec<String> {
-    if let Some(value) = env_value("ELOWEN_ALLOWED_REPOS", env_overlay) {
-        return parse_list_value(&value);
-    }
-
-    if allowed_repo_roots.is_empty() {
-        return default.iter().map(|value| value.to_string()).collect();
-    }
-
-    Vec::new()
-}
-
-fn parse_json_list_env(key: &str, env_overlay: &EnvOverlay) -> anyhow::Result<Vec<String>> {
-    let Some(value) = env_value(key, env_overlay) else {
-        return Ok(Vec::new());
-    };
-
-    serde_json::from_str::<Vec<String>>(&value)
-        .with_context(|| format!("failed to parse {key} as a JSON string array"))
-}
-
-fn parse_list_value(value: &str) -> Vec<String> {
-    let mut items = Vec::new();
-
-    for candidate in value.split(',') {
-        let trimmed = candidate.trim();
-        if trimmed.is_empty() || items.iter().any(|item| item == trimmed) {
-            continue;
-        }
-
-        items.push(trimmed.to_string());
-    }
-
-    items
-}
-
-fn parse_repo_root_env(
-    key: &str,
-    workspace_root: &Path,
-    env_overlay: &EnvOverlay,
-) -> anyhow::Result<Vec<PathBuf>> {
-    let Some(value) = env_value(key, env_overlay) else {
-        return Ok(Vec::new());
-    };
-
-    let mut roots = Vec::new();
-
-    for candidate in value.split(',') {
-        let trimmed = candidate.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let raw_path = PathBuf::from(trimmed);
-        let resolved = if raw_path.is_absolute() {
-            raw_path
-        } else {
-            workspace_root.join(raw_path)
-        };
-        let canonical = stdfs::canonicalize(&resolved)
-            .with_context(|| format!("failed to resolve repository root {}", resolved.display()))?;
-
-        if !canonical.is_dir() {
-            anyhow::bail!(
-                "configured repository root {} is not a directory",
-                canonical.display()
-            );
-        }
-
-        if roots.iter().any(|existing| existing == &canonical) {
-            continue;
-        }
-
-        roots.push(canonical);
-    }
-
-    Ok(roots)
-}
-
-fn parse_repo_policy_path_env(
-    key: &str,
-    workspace_root: &Path,
-    allowed_repo_roots: &[PathBuf],
-    env_overlay: &EnvOverlay,
-) -> anyhow::Result<Vec<PathBuf>> {
-    let Some(value) = env_value(key, env_overlay) else {
-        return Ok(Vec::new());
-    };
-
-    let mut paths = Vec::new();
-
-    for candidate in value.split(',') {
-        let trimmed = candidate.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let raw_path = PathBuf::from(trimmed);
-        let resolved = if raw_path.is_absolute() {
-            raw_path
-        } else {
-            workspace_root.join(raw_path)
-        };
-        let canonical = stdfs::canonicalize(&resolved).with_context(|| {
-            format!(
-                "failed to resolve repository policy path {}",
-                resolved.display()
-            )
-        })?;
-
-        if !canonical.exists() {
-            anyhow::bail!(
-                "configured repository policy path {} does not exist",
-                canonical.display()
-            );
-        }
-
-        if !allowed_repo_roots
-            .iter()
-            .any(|root| canonical.starts_with(root))
-        {
-            anyhow::bail!(
-                "configured repository policy path {} is outside the trusted repository roots",
-                canonical.display()
-            );
-        }
-
-        if paths.iter().any(|existing| existing == &canonical) {
-            continue;
-        }
-
-        paths.push(canonical);
-    }
-
-    Ok(paths)
-}
-
-fn startup_usage() -> &'static str {
-    "Usage: elowen-edge [--env-file PATH] [--generate-trust-keypair]\n\n\
-Reads runtime configuration from the process environment. When --env-file is set,\n\
-the file is parsed first and the current process environment still wins on conflicts.\n\
-You can also set ELOWEN_EDGE_ENV_FILE instead of passing --env-file.\n\n\
-Use --generate-trust-keypair to print base64url Ed25519 key material for Slice 28 trusted registration.\n"
-}
-
-fn parse_trusted_orchestrator_keys(
-    env_overlay: &EnvOverlay,
-) -> anyhow::Result<Vec<TrustedOrchestratorKey>> {
-    let mut keys = Vec::new();
-
-    if let Some(value) = env_value("ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON", env_overlay) {
-        let parsed = serde_json::from_str::<Vec<TrustedOrchestratorKeyEnv>>(&value)
-            .context("failed to parse ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON")?;
-
-        for entry in parsed {
-            let public_key = entry.public_key.trim();
-            if public_key.is_empty() {
-                anyhow::bail!(
-                    "ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON cannot contain empty public keys"
-                );
-            }
-
-            push_unique_orchestrator_key(
-                &mut keys,
-                TrustedOrchestratorKey {
-                    key_id: entry
-                        .key_id
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty()),
-                    public_key: public_key.to_string(),
-                },
-            );
-        }
-    }
-
-    if let Some(value) = env_value("ELOWEN_ORCHESTRATOR_PUBLIC_KEYS", env_overlay) {
-        for public_key in parse_list_value(&value) {
-            push_unique_orchestrator_key(
-                &mut keys,
-                TrustedOrchestratorKey {
-                    key_id: None,
-                    public_key,
-                },
-            );
-        }
-    }
-
-    if let Some(value) = env_value("ELOWEN_ORCHESTRATOR_PUBLIC_KEY", env_overlay) {
-        push_unique_orchestrator_key(
-            &mut keys,
-            TrustedOrchestratorKey {
-                key_id: None,
-                public_key: value,
-            },
-        );
-    }
-
-    Ok(keys)
-}
-
-fn push_unique_orchestrator_key(
-    keys: &mut Vec<TrustedOrchestratorKey>,
-    candidate: TrustedOrchestratorKey,
-) {
-    let duplicate = keys.iter().any(|existing| {
-        existing.public_key == candidate.public_key && existing.key_id == candidate.key_id
-    });
-    if !duplicate {
-        keys.push(candidate);
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct TrustedOrchestratorKeyEnv {
-    #[serde(default)]
-    key_id: Option<String>,
-    public_key: String,
-}
-
 fn parse_env_file_value(raw_value: &str) -> String {
     if raw_value.len() >= 2 {
         let bytes = raw_value.as_bytes();
@@ -473,11 +648,22 @@ fn parse_env_file_value(raw_value: &str) -> String {
     raw_value.to_string()
 }
 
+fn parse_paths_value(value: &str) -> Vec<PathBuf> {
+    parse_list_value(value)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn parse_list_value(value: &str) -> Vec<String> {
+    unique_strings(value.split(',').map(str::to_string).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EnvOverlay, TrustedOrchestratorKey, parse_allowed_repos_env, parse_repo_policy_path_env,
-        parse_repo_root_env, parse_trusted_orchestrator_keys,
+        EdgeConfig, EdgeConfigFile, OrchestratorSection, RepositorySection, ServiceSection,
+        TrustSection, import_env_file,
     };
     use std::{fs, path::PathBuf};
 
@@ -490,102 +676,126 @@ mod tests {
     }
 
     #[test]
-    fn repo_roots_are_resolved_relative_to_workspace() {
-        let workspace_root = unique_temp_dir("workspace");
-        let child = workspace_root.join("repos");
-        fs::create_dir_all(&child).unwrap();
+    fn toml_config_resolves_repo_roots_relative_to_config() {
+        let root = unique_temp_dir("toml-root");
+        let repos = root.join("repos");
+        fs::create_dir_all(&repos).unwrap();
+        let file = EdgeConfigFile {
+            orchestrator: OrchestratorSection {
+                nats_url: Some("nats://127.0.0.1:4222".to_string()),
+                ..Default::default()
+            },
+            repositories: RepositorySection {
+                workspace_root: Some(root.clone()),
+                allowed_roots: vec![PathBuf::from("repos")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        let mut overlay = EnvOverlay::new();
-        overlay.insert("ELOWEN_ALLOWED_REPO_ROOTS".to_string(), "repos".to_string());
+        let config = EdgeConfig::from_file(&root.join("edge.toml"), file).unwrap();
 
-        let roots =
-            parse_repo_root_env("ELOWEN_ALLOWED_REPO_ROOTS", &workspace_root, &overlay).unwrap();
-
-        assert_eq!(roots, vec![fs::canonicalize(child).unwrap()]);
-
-        let _ = fs::remove_dir_all(workspace_root);
+        assert_eq!(
+            config.allowed_repo_roots,
+            vec![fs::canonicalize(repos).unwrap()]
+        );
+        assert!(config.allowed_repos.is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn explicit_allowlist_defaults_to_empty_when_roots_are_configured() {
-        let allowed_repos = parse_allowed_repos_env(
-            &["elowen-api"],
-            &[PathBuf::from("D:\\Projects")],
-            &EnvOverlay::new(),
-        );
+    fn explicit_allowlist_defaults_when_roots_are_absent() {
+        let root = unique_temp_dir("default-repos");
+        let file = EdgeConfigFile {
+            orchestrator: OrchestratorSection {
+                nats_url: Some("nats://127.0.0.1:4222".to_string()),
+                ..Default::default()
+            },
+            repositories: RepositorySection {
+                workspace_root: Some(root.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        assert!(allowed_repos.is_empty());
+        let config = EdgeConfig::from_file(&root.join("edge.toml"), file).unwrap();
+
+        assert!(config.allowed_repos.iter().any(|repo| repo == "elowen-api"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn excluded_repo_paths_resolve_under_trusted_roots() {
-        let workspace_root = unique_temp_dir("policy-workspace");
-        let repos_root = workspace_root.join("repos");
-        let excluded = repos_root.join("private");
-        fs::create_dir_all(&excluded).unwrap();
+    fn service_name_defaults_and_trims() {
+        let root = unique_temp_dir("service-name");
+        let file = EdgeConfigFile {
+            orchestrator: OrchestratorSection {
+                nats_url: Some("nats://127.0.0.1:4222".to_string()),
+                ..Default::default()
+            },
+            repositories: RepositorySection {
+                workspace_root: Some(root.clone()),
+                ..Default::default()
+            },
+            service: ServiceSection {
+                name: Some(" ElowenEdge ".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        let mut overlay = EnvOverlay::new();
-        overlay.insert(
-            "ELOWEN_REPO_SCAN_EXCLUDE_PATHS".to_string(),
-            "repos/private".to_string(),
-        );
+        let config = EdgeConfig::from_file(&root.join("edge.toml"), file).unwrap();
 
-        let paths = parse_repo_policy_path_env(
-            "ELOWEN_REPO_SCAN_EXCLUDE_PATHS",
-            &workspace_root,
-            &[fs::canonicalize(&repos_root).unwrap()],
-            &overlay,
+        assert_eq!(config.service_name, "ElowenEdge");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_env_writes_toml_and_secret_files() {
+        let root = unique_temp_dir("import");
+        let env_file = root.join("edge.env");
+        let config_file = root.join("edge.toml");
+        fs::write(
+            &env_file,
+            "ELOWEN_NATS_URL=nats://127.0.0.1:4222\nELOWEN_EDGE_SIGNING_KEY=secret\n",
         )
         .unwrap();
 
-        assert_eq!(paths, vec![fs::canonicalize(excluded).unwrap()]);
+        import_env_file(&env_file, &config_file).unwrap();
 
-        let _ = fs::remove_dir_all(workspace_root);
+        let body = fs::read_to_string(&config_file).unwrap();
+        assert!(body.contains("nats://127.0.0.1:4222"));
+        assert!(root.join("secrets").join("edge-signing-key.txt").exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn trusted_orchestrator_keys_support_json_and_legacy_envs() {
-        let mut overlay = EnvOverlay::new();
-        overlay.insert(
-            "ELOWEN_TRUSTED_ORCHESTRATOR_KEYS_JSON".to_string(),
-            r#"[{"key_id":"current","public_key":"key-a"},{"key_id":"next","public_key":"key-b"}]"#
-                .to_string(),
-        );
-        overlay.insert(
-            "ELOWEN_ORCHESTRATOR_PUBLIC_KEY".to_string(),
-            "key-b".to_string(),
-        );
-        overlay.insert(
-            "ELOWEN_ORCHESTRATOR_PUBLIC_KEYS".to_string(),
-            "key-c,key-a".to_string(),
-        );
+    fn missing_secret_file_fails_config_load() {
+        let root = unique_temp_dir("missing-secret");
+        let file = EdgeConfigFile {
+            orchestrator: OrchestratorSection {
+                nats_url: Some("nats://127.0.0.1:4222".to_string()),
+                ..Default::default()
+            },
+            repositories: RepositorySection {
+                workspace_root: Some(root.clone()),
+                ..Default::default()
+            },
+            trust: TrustSection {
+                edge_signing_key_path: Some(PathBuf::from("missing.txt")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        let keys = parse_trusted_orchestrator_keys(&overlay).unwrap();
+        let error = match EdgeConfig::from_file(&root.join("edge.toml"), file) {
+            Ok(_) => panic!("config load should fail for a missing secret file"),
+            Err(error) => error,
+        };
 
-        assert_eq!(
-            keys,
-            vec![
-                TrustedOrchestratorKey {
-                    key_id: Some("current".to_string()),
-                    public_key: "key-a".to_string(),
-                },
-                TrustedOrchestratorKey {
-                    key_id: Some("next".to_string()),
-                    public_key: "key-b".to_string(),
-                },
-                TrustedOrchestratorKey {
-                    key_id: None,
-                    public_key: "key-c".to_string(),
-                },
-                TrustedOrchestratorKey {
-                    key_id: None,
-                    public_key: "key-a".to_string(),
-                },
-                TrustedOrchestratorKey {
-                    key_id: None,
-                    public_key: "key-b".to_string(),
-                },
-            ]
+        assert!(
+            error.to_string().contains("No such file")
+                || error.to_string().contains("system cannot find")
         );
+        let _ = fs::remove_dir_all(root);
     }
 }

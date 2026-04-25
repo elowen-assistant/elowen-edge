@@ -1427,7 +1427,7 @@ pub(crate) async fn preflight_codex_runner(config: &EdgeConfig) -> anyhow::Resul
     validate_codex_args(&config.codex_args)?;
     if is_disallowed_validation_program(command) {
         return Err(sandbox_error(format!(
-            "configured Codex command `{command}` is not allowed; point ELOWEN_CODEX_COMMAND at the Codex binary directly"
+            "configured Codex command `{command}` is not allowed; point [runner].codex_command at the Codex binary directly"
         )));
     }
 
@@ -1447,6 +1447,109 @@ pub(crate) async fn preflight_codex_runner(config: &EdgeConfig) -> anyhow::Resul
     let version = truncate_text(&String::from_utf8_lossy(&output.stdout), 200);
     info!(command = %command, version = %version, "Codex CLI preflight succeeded");
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodexCommandDiscovery {
+    pub(crate) command: String,
+    pub(crate) version: String,
+}
+
+pub(crate) async fn discover_codex_command() -> anyhow::Result<Option<CodexCommandDiscovery>> {
+    let candidates = discover_codex_candidates().await;
+    for candidate in candidates {
+        if is_disallowed_validation_program(&candidate) {
+            continue;
+        }
+        let output = Command::new(&candidate).arg("--version").output().await;
+        let Ok(output) = output else {
+            continue;
+        };
+        if output.status.success() {
+            let version = truncate_text(&String::from_utf8_lossy(&output.stdout), 200)
+                .trim()
+                .to_string();
+            return Ok(Some(CodexCommandDiscovery {
+                command: candidate,
+                version,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+async fn discover_codex_candidates() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        discover_codex_candidates_windows().await
+    }
+    #[cfg(not(windows))]
+    {
+        discover_codex_candidates_unix().await
+    }
+}
+
+#[cfg(windows)]
+async fn discover_codex_candidates_windows() -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    let power_shell_output = Command::new(windows_powershell_path())
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Command codex.cmd,codex.exe,codex -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source",
+        ])
+        .output()
+        .await;
+    if let Ok(output) = power_shell_output {
+        candidates.extend(command_output_lines(&output.stdout));
+    }
+
+    let where_output = Command::new("where.exe").arg("codex").output().await;
+    if let Ok(output) = where_output {
+        candidates.extend(command_output_lines(&output.stdout));
+    }
+
+    candidates.push("codex.cmd".to_string());
+    candidates.push("codex.exe".to_string());
+    candidates.push("codex".to_string());
+    unique_nonempty(candidates)
+}
+
+#[cfg(windows)]
+fn windows_powershell_path() -> &'static str {
+    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+}
+
+#[cfg(not(windows))]
+async fn discover_codex_candidates_unix() -> Vec<String> {
+    let mut candidates = Vec::new();
+    let output = Command::new("which").arg("codex").output().await;
+    if let Ok(output) = output {
+        candidates.extend(command_output_lines(&output.stdout));
+    }
+    candidates.push("codex".to_string());
+    unique_nonempty(candidates)
+}
+
+fn command_output_lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn unique_nonempty(values: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !unique.iter().any(|existing| existing == trimmed) {
+            unique.push(trimmed.to_string());
+        }
+    }
+    unique
 }
 
 fn build_codex_exec_args(
@@ -1485,19 +1588,19 @@ fn validate_codex_args(args: &[String]) -> anyhow::Result<()> {
 
         if matches!(normalized, "exec" | "e" | "-" | "review" | "resume") {
             anyhow::bail!(
-                "ELOWEN_CODEX_ARGS_JSON should contain extra Codex exec flags only; remove `{normalized}`"
+                "[runner].codex_args should contain extra Codex exec flags only; remove `{normalized}`"
             );
         }
 
         if matches!(normalized, "-C" | "--cd" | "-o" | "--output-last-message") {
             anyhow::bail!(
-                "ELOWEN_CODEX_ARGS_JSON must not include `{normalized}` because elowen-edge manages the working directory and output paths"
+                "[runner].codex_args must not include `{normalized}` because elowen-edge manages the working directory and output paths"
             );
         }
 
         if normalized.starts_with("--cd=") || normalized.starts_with("--output-last-message=") {
             anyhow::bail!(
-                "ELOWEN_CODEX_ARGS_JSON must not override Codex working directory or output file paths"
+                "[runner].codex_args must not override Codex working directory or output file paths"
             );
         }
     }

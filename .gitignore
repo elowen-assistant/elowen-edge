@@ -1,6 +1,10 @@
 target/
+dist/
 .env
 .env.local
 edge.env.local
+edge.toml
+edge.local.toml
+secrets/
 .idea/
 .vscode/

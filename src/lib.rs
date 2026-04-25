@@ -8,6 +8,9 @@ mod execution;
 mod registration;
 mod runtime;
 mod sandbox;
+mod service;
+mod status;
+mod tui;
 
 pub(crate) use discovery::{detect_device_id, detect_device_name};
 pub(crate) use registration::parse_bool;
