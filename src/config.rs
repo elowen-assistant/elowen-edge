@@ -31,6 +31,11 @@ pub(crate) enum EdgeCommand {
         env_file: PathBuf,
         config_path: PathBuf,
     },
+    ImportTrustKey {
+        from_path: PathBuf,
+        to_path: PathBuf,
+        provider: SecretProviderKind,
+    },
     GenerateTrustKeypair,
 }
 
@@ -79,12 +84,12 @@ pub(crate) struct EdgeConfig {
     pub(crate) orchestrator_keys_path: Option<PathBuf>,
     /// Current edge signing key used for trusted registration.
     pub(crate) edge_signing_key: Option<String>,
-    /// Path to the configured current edge signing key.
-    pub(crate) edge_signing_key_path: Option<PathBuf>,
+    /// Configured current edge signing key provider.
+    pub(crate) edge_signing_key_ref: Option<SecretReference>,
     /// Previous edge signing key used during trusted re-enrollment.
     pub(crate) previous_edge_signing_key: Option<String>,
-    /// Path to the configured previous edge signing key.
-    pub(crate) previous_edge_signing_key_path: Option<PathBuf>,
+    /// Configured previous edge signing key provider.
+    pub(crate) previous_edge_signing_key_ref: Option<SecretReference>,
     /// Local state directory for status and runtime artifacts.
     pub(crate) state_dir: PathBuf,
     /// Local JSON status file path.
@@ -169,6 +174,54 @@ pub(crate) struct TrustSection {
     pub(crate) orchestrator_keys_path: Option<PathBuf>,
     pub(crate) edge_signing_key_path: Option<PathBuf>,
     pub(crate) previous_edge_signing_key_path: Option<PathBuf>,
+    pub(crate) edge_signing_key: Option<SecretReference>,
+    pub(crate) previous_edge_signing_key: Option<SecretReference>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct SecretReference {
+    /// Backend used to read the secret.
+    pub(crate) provider: SecretProviderKind,
+    /// File path used by file and DPAPI-backed-file providers.
+    pub(crate) path: Option<PathBuf>,
+    /// Reserved lookup name for provider backends that address secrets by key.
+    pub(crate) name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SecretProviderKind {
+    /// Plaintext file backend for Linux/container mounts and compatibility.
+    File,
+    /// Windows DPAPI-protected bytes stored in a local file.
+    Dpapi,
+    /// Reserved Windows Credential Manager backend.
+    WindowsCredential,
+}
+
+impl SecretReference {
+    pub(crate) fn file(path: PathBuf) -> Self {
+        Self {
+            provider: SecretProviderKind::File,
+            path: Some(path),
+            name: None,
+        }
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        self.provider.label()
+    }
+}
+
+impl SecretProviderKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Dpapi => "dpapi",
+            Self::WindowsCredential => "windows-credential",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,18 +289,16 @@ impl EdgeConfig {
             .as_ref()
             .map(|path| resolve_path(config_dir, path.clone()))
             .transpose()?;
-        let edge_signing_key_path = file
-            .trust
-            .edge_signing_key_path
-            .as_ref()
-            .map(|path| resolve_path(config_dir, path.clone()))
-            .transpose()?;
-        let previous_edge_signing_key_path = file
-            .trust
-            .previous_edge_signing_key_path
-            .as_ref()
-            .map(|path| resolve_path(config_dir, path.clone()))
-            .transpose()?;
+        let edge_signing_key_ref = normalized_secret_reference(
+            "edge signing key",
+            file.trust.edge_signing_key,
+            file.trust.edge_signing_key_path,
+        )?;
+        let previous_edge_signing_key_ref = normalized_secret_reference(
+            "previous edge signing key",
+            file.trust.previous_edge_signing_key,
+            file.trust.previous_edge_signing_key_path,
+        )?;
 
         Ok(Self {
             config_path: config_path.to_path_buf(),
@@ -277,13 +328,13 @@ impl EdgeConfig {
                 file.trust.orchestrator_keys_path.as_deref(),
             )?,
             orchestrator_keys_path,
-            edge_signing_key: load_secret(config_dir, file.trust.edge_signing_key_path.as_deref())?,
-            edge_signing_key_path,
-            previous_edge_signing_key: load_secret(
+            edge_signing_key: load_secret_reference(config_dir, edge_signing_key_ref.as_ref())?,
+            edge_signing_key_ref,
+            previous_edge_signing_key: load_secret_reference(
                 config_dir,
-                file.trust.previous_edge_signing_key_path.as_deref(),
+                previous_edge_signing_key_ref.as_ref(),
             )?,
-            previous_edge_signing_key_path,
+            previous_edge_signing_key_ref,
             status_path: state_dir.join("status.json"),
             state_dir,
             service_name: default_service_name(file.service.name),
@@ -322,6 +373,14 @@ pub(crate) fn parse_command() -> anyhow::Result<EdgeCommand> {
         }),
         "trust" if args.first().map(String::as_str) == Some("generate-keypair") => {
             Ok(EdgeCommand::GenerateTrustKeypair)
+        }
+        "trust" if args.first().map(String::as_str) == Some("import-key") => {
+            args.remove(0);
+            Ok(EdgeCommand::ImportTrustKey {
+                from_path: take_path_arg(&mut args, "--from")?,
+                to_path: take_path_arg(&mut args, "--to")?,
+                provider: take_provider_arg(&mut args, "--provider")?,
+            })
         }
         "config" if args.first().map(String::as_str) == Some("import-env") => {
             args.remove(0);
@@ -411,6 +470,28 @@ pub(crate) fn import_env_file(env_file: &Path, config_path: &Path) -> anyhow::Re
     Ok(())
 }
 
+/// Imports existing edge key material into a supported secret backend.
+pub(crate) fn import_trust_key(
+    from_path: &Path,
+    to_path: &Path,
+    provider: SecretProviderKind,
+) -> anyhow::Result<()> {
+    let value = stdfs::read_to_string(from_path)
+        .with_context(|| format!("failed to read source key {}", from_path.display()))?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        anyhow::bail!("source key {} is empty", from_path.display());
+    }
+    write_secret_value(to_path, provider, &value).with_context(|| {
+        format!(
+            "failed to write {} secret {}",
+            provider.label(),
+            to_path.display()
+        )
+    })
+}
+
 fn import_trust_files(overlay: &EnvOverlay, secret_dir: &Path) -> anyhow::Result<TrustSection> {
     let mut trust = TrustSection::default();
 
@@ -465,12 +546,34 @@ fn take_path_arg(args: &mut Vec<String>, name: &str) -> anyhow::Result<PathBuf> 
     Ok(PathBuf::from(value))
 }
 
+fn take_provider_arg(args: &mut Vec<String>, name: &str) -> anyhow::Result<SecretProviderKind> {
+    let Some(index) = args.iter().position(|arg| arg == name) else {
+        anyhow::bail!("missing required {name}\n\n{}", startup_usage());
+    };
+    if index + 1 >= args.len() {
+        anyhow::bail!("missing value after {name}");
+    }
+    let value = args.remove(index + 1);
+    args.remove(index);
+    parse_secret_provider(&value)
+}
+
+fn parse_secret_provider(value: &str) -> anyhow::Result<SecretProviderKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "file" => Ok(SecretProviderKind::File),
+        "dpapi" | "windows-dpapi" => Ok(SecretProviderKind::Dpapi),
+        "windows-credential" | "credential" => Ok(SecretProviderKind::WindowsCredential),
+        _ => anyhow::bail!("unsupported secret provider `{value}`"),
+    }
+}
+
 fn startup_usage() -> &'static str {
     "Usage:\n\
   elowen-edge run --config PATH\n\
   elowen-edge tui --config PATH\n\
   elowen-edge config import-env --env-file PATH --config PATH\n\
-  elowen-edge trust generate-keypair\n\n\
+  elowen-edge trust generate-keypair\n\
+  elowen-edge trust import-key --from PATH --to PATH --provider file|dpapi\n\n\
 TOML config is required for runtime startup. Legacy env files are supported only by import-env.\n"
 }
 
@@ -537,13 +640,79 @@ fn resolve_policy_paths(
     Ok(resolved)
 }
 
-fn load_secret(base: &Path, path: Option<&Path>) -> anyhow::Result<Option<String>> {
-    let Some(path) = path else {
+fn normalized_secret_reference(
+    label: &str,
+    reference: Option<SecretReference>,
+    legacy_path: Option<PathBuf>,
+) -> anyhow::Result<Option<SecretReference>> {
+    match (reference, legacy_path) {
+        (Some(_), Some(path)) => {
+            anyhow::bail!(
+                "configure either the provider-backed {label} or legacy path {}, not both",
+                path.display()
+            )
+        }
+        (Some(reference), None) => Ok(Some(reference)),
+        (None, Some(path)) => Ok(Some(SecretReference::file(path))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn load_secret_reference(
+    base: &Path,
+    reference: Option<&SecretReference>,
+) -> anyhow::Result<Option<String>> {
+    let Some(reference) = reference else {
         return Ok(None);
     };
+    let Some(path) = reference.path.as_deref() else {
+        anyhow::bail!(
+            "{} secret provider requires a path in this release",
+            reference.label()
+        );
+    };
     let path = resolve_path(base, path.to_path_buf())?;
-    warn_if_secret_permissions_are_broad(&path)?;
-    let value = stdfs::read_to_string(&path)
+    load_secret_from_path(reference.provider, &path)
+}
+
+fn load_secret_from_path(
+    provider: SecretProviderKind,
+    path: &Path,
+) -> anyhow::Result<Option<String>> {
+    match provider {
+        SecretProviderKind::File => load_file_secret(path),
+        SecretProviderKind::Dpapi => read_dpapi_secret(path),
+        SecretProviderKind::WindowsCredential => anyhow::bail!(
+            "windows-credential secret provider is reserved for a future backend; use dpapi or file"
+        ),
+    }
+}
+
+fn write_secret_value(
+    path: &Path,
+    provider: SecretProviderKind,
+    value: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        stdfs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    match provider {
+        SecretProviderKind::File => {
+            stdfs::write(path, value)
+                .with_context(|| format!("failed to write secret file {}", path.display()))?;
+            Ok(())
+        }
+        SecretProviderKind::Dpapi => write_dpapi_secret(path, value),
+        SecretProviderKind::WindowsCredential => anyhow::bail!(
+            "windows-credential secret provider is reserved for a future backend; use dpapi or file"
+        ),
+    }
+}
+
+fn load_file_secret(path: &Path) -> anyhow::Result<Option<String>> {
+    warn_if_secret_permissions_are_broad(path)?;
+    let value = stdfs::read_to_string(path)
         .with_context(|| format!("failed to read secret file {}", path.display()))?
         .trim()
         .to_string();
@@ -606,6 +775,122 @@ fn warn_if_secret_permissions_are_broad(path: &Path) -> anyhow::Result<()> {
 fn warn_if_secret_permissions_are_broad(path: &Path) -> anyhow::Result<()> {
     let _ = stdfs::metadata(path)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn write_dpapi_secret(path: &Path, value: &str) -> anyhow::Result<()> {
+    let protected = dpapi_protect(value.as_bytes())?;
+    stdfs::write(path, protected)
+        .with_context(|| format!("failed to write DPAPI secret {}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn write_dpapi_secret(path: &Path, _value: &str) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "dpapi secret provider is only available on Windows; cannot write {}",
+        path.display()
+    )
+}
+
+#[cfg(windows)]
+fn read_dpapi_secret(path: &Path) -> anyhow::Result<Option<String>> {
+    let protected = stdfs::read(path)
+        .with_context(|| format!("failed to read DPAPI secret {}", path.display()))?;
+    let bytes = dpapi_unprotect(&protected)?;
+    let value = String::from_utf8(bytes)
+        .with_context(|| format!("DPAPI secret {} is not valid UTF-8", path.display()))?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        anyhow::bail!("DPAPI secret {} is empty", path.display());
+    }
+    Ok(Some(value))
+}
+
+#[cfg(not(windows))]
+fn read_dpapi_secret(path: &Path) -> anyhow::Result<Option<String>> {
+    anyhow::bail!(
+        "dpapi secret provider is only available on Windows; cannot read {}",
+        path.display()
+    )
+}
+
+#[cfg(windows)]
+fn dpapi_protect(value: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::{ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData},
+    };
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: value.len() as u32,
+        pbData: value.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptProtectData(
+            &input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!("CryptProtectData failed");
+    }
+    let protected =
+        unsafe { slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(protected)
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect(value: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::{ptr, slice};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{
+            CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
+        },
+    };
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: value.len() as u32,
+        pbData: value.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!("CryptUnprotectData failed");
+    }
+    let cleartext =
+        unsafe { slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(cleartext)
 }
 
 fn trimmed(value: Option<String>) -> Option<String> {
@@ -701,8 +986,8 @@ fn parse_list_value(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EdgeConfig, EdgeConfigFile, OrchestratorSection, RepositorySection, ServiceSection,
-        TrustSection, import_env_file,
+        EdgeConfig, EdgeConfigFile, OrchestratorSection, RepositorySection, SecretProviderKind,
+        SecretReference, ServiceSection, TrustSection, import_env_file, import_trust_key,
     };
     use std::{fs, path::PathBuf};
 
@@ -835,6 +1120,125 @@ mod tests {
             error.to_string().contains("No such file")
                 || error.to_string().contains("system cannot find")
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_file_secret_loads_without_legacy_path() {
+        let root = unique_temp_dir("provider-file");
+        let secret = root.join("edge.key");
+        fs::write(&secret, "provider-secret").unwrap();
+        let file = EdgeConfigFile {
+            orchestrator: OrchestratorSection {
+                nats_url: Some("nats://127.0.0.1:4222".to_string()),
+                ..Default::default()
+            },
+            repositories: RepositorySection {
+                workspace_root: Some(root.clone()),
+                ..Default::default()
+            },
+            trust: TrustSection {
+                edge_signing_key: Some(SecretReference {
+                    provider: SecretProviderKind::File,
+                    path: Some(PathBuf::from("edge.key")),
+                    name: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let config = EdgeConfig::from_file(&root.join("edge.toml"), file).unwrap();
+
+        assert_eq!(config.edge_signing_key.as_deref(), Some("provider-secret"));
+        assert_eq!(
+            config
+                .edge_signing_key_ref
+                .as_ref()
+                .map(|reference| reference.provider),
+            Some(SecretProviderKind::File)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_and_legacy_key_path_conflict() {
+        let root = unique_temp_dir("provider-conflict");
+        let file = EdgeConfigFile {
+            orchestrator: OrchestratorSection {
+                nats_url: Some("nats://127.0.0.1:4222".to_string()),
+                ..Default::default()
+            },
+            repositories: RepositorySection {
+                workspace_root: Some(root.clone()),
+                ..Default::default()
+            },
+            trust: TrustSection {
+                edge_signing_key_path: Some(PathBuf::from("edge.key")),
+                edge_signing_key: Some(SecretReference {
+                    provider: SecretProviderKind::File,
+                    path: Some(PathBuf::from("edge.key")),
+                    name: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = match EdgeConfig::from_file(&root.join("edge.toml"), file) {
+            Ok(_) => panic!("config load should fail when provider and legacy path both exist"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("configure either"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_key_file_provider_writes_trimmed_secret() {
+        let root = unique_temp_dir("import-key-file");
+        let source = root.join("source.key");
+        let target = root.join("nested").join("target.key");
+        fs::write(&source, " secret-value \n").unwrap();
+
+        import_trust_key(&source, &target, SecretProviderKind::File).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "secret-value");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn import_key_dpapi_provider_round_trips_on_windows() {
+        let root = unique_temp_dir("import-key-dpapi");
+        let source = root.join("source.key");
+        let target = root.join("target.dpapi");
+        fs::write(&source, "secret-value").unwrap();
+
+        import_trust_key(&source, &target, SecretProviderKind::Dpapi).unwrap();
+        let file = EdgeConfigFile {
+            orchestrator: OrchestratorSection {
+                nats_url: Some("nats://127.0.0.1:4222".to_string()),
+                ..Default::default()
+            },
+            repositories: RepositorySection {
+                workspace_root: Some(root.clone()),
+                ..Default::default()
+            },
+            trust: TrustSection {
+                edge_signing_key: Some(SecretReference {
+                    provider: SecretProviderKind::Dpapi,
+                    path: Some(target),
+                    name: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let config = EdgeConfig::from_file(&root.join("edge.toml"), file).unwrap();
+
+        assert_eq!(config.edge_signing_key.as_deref(), Some("secret-value"));
         let _ = fs::remove_dir_all(root);
     }
 }

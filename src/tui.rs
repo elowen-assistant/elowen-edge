@@ -541,20 +541,20 @@ fn trust_readiness_detail(config: &EdgeConfig) -> String {
     let trust_bundle = config
         .orchestrator_keys_path
         .as_ref()
-        .map(|path| path.display().to_string())
+        .map(|_| "configured".to_string())
         .unwrap_or_else(|| "not configured".to_string());
     let edge_key = config
-        .edge_signing_key_path
+        .edge_signing_key_ref
         .as_ref()
-        .map(|path| path.display().to_string())
+        .map(secret_reference_readiness_summary)
         .unwrap_or_else(|| "not configured".to_string());
-    let previous_key = if config.previous_edge_signing_key_path.is_some() {
-        "previous key configured for rotation; confirm rotation in orchestrator admin UI"
+    let previous_key = if config.previous_edge_signing_key_ref.is_some() {
+        "previous key configured"
     } else {
-        "no previous key configured"
+        "previous key not configured"
     };
     format!(
-        "{} trusted signer(s); trust bundle {}; edge key {}; {}",
+        "{} signer(s); bundle {}; edge key {}; {}",
         config.trusted_orchestrator_keys.len(),
         trust_bundle,
         edge_key,
@@ -581,7 +581,17 @@ fn trust_diagnostics(config: &EdgeConfig) -> String {
         "Previous edge signing key is not configured. That is expected unless this device is rotating its edge key."
     };
     format!(
-        "Trust files passed permission checks.\nTrusted orchestrator signers:\n{}\n{}",
+        "Trust material loaded.\nEdge key backend: {}\nPrevious key backend: {}\nTrusted orchestrator signers:\n{}\n{}",
+        config
+            .edge_signing_key_ref
+            .as_ref()
+            .map(secret_reference_summary)
+            .unwrap_or_else(|| "not configured".to_string()),
+        config
+            .previous_edge_signing_key_ref
+            .as_ref()
+            .map(secret_reference_summary)
+            .unwrap_or_else(|| "not configured".to_string()),
         if signer_lines.is_empty() {
             "- none configured".to_string()
         } else {
@@ -589,6 +599,29 @@ fn trust_diagnostics(config: &EdgeConfig) -> String {
         },
         previous
     )
+}
+
+fn secret_reference_summary(reference: &crate::config::SecretReference) -> String {
+    let location = reference
+        .path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .or_else(|| reference.name.clone())
+        .unwrap_or_else(|| "unnamed".to_string());
+    let mode = match reference.provider {
+        crate::config::SecretProviderKind::File => "compatibility plaintext file",
+        crate::config::SecretProviderKind::Dpapi => "Windows DPAPI-protected file",
+        crate::config::SecretProviderKind::WindowsCredential => "Windows Credential Manager",
+    };
+    format!("{} ({mode}: {location})", reference.label())
+}
+
+fn secret_reference_readiness_summary(reference: &crate::config::SecretReference) -> String {
+    match reference.provider {
+        crate::config::SecretProviderKind::File => "file compatibility mode".to_string(),
+        crate::config::SecretProviderKind::Dpapi => "dpapi protected".to_string(),
+        crate::config::SecretProviderKind::WindowsCredential => "windows credential".to_string(),
+    }
 }
 
 fn run_trust_challenge_check(config: &EdgeConfig) -> String {

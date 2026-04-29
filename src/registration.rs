@@ -138,7 +138,7 @@ async fn build_registration_trust_proof(
     }
     let Some(edge_signing_key) = config.edge_signing_key.as_deref() else {
         anyhow::bail!(
-            "ELOWEN_EDGE_SIGNING_KEY is required when trusted orchestrator key pinning is configured"
+            "an edge signing-key provider is required when trusted orchestrator key pinning is configured"
         );
     };
 

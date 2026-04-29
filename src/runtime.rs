@@ -63,6 +63,11 @@ pub fn run() -> anyhow::Result<()> {
             env_file,
             config_path,
         } => crate::config::import_env_file(&env_file, &config_path),
+        EdgeCommand::ImportTrustKey {
+            from_path,
+            to_path,
+            provider,
+        } => crate::config::import_trust_key(&from_path, &to_path, provider),
         EdgeCommand::GenerateTrustKeypair => {
             print_trust_keypair();
             Ok(())

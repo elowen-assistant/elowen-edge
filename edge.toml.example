@@ -30,8 +30,16 @@ sandbox_mode = "workspace"
 
 [trust]
 orchestrator_keys_path = "secrets\\orchestrator-trust.json"
-edge_signing_key_path = "secrets\\edge-signing-key.txt"
-# previous_edge_signing_key_path = "secrets\\previous-edge-signing-key.txt"
+
+[trust.edge_signing_key]
+# Use "dpapi" on Windows for a protected local file, or "file" for Linux,
+# containers, and explicit compatibility mode.
+provider = "dpapi"
+path = "secrets\\edge-signing-key.dpapi"
+
+# [trust.previous_edge_signing_key]
+# provider = "dpapi"
+# path = "secrets\\previous-edge-signing-key.dpapi"
 
 [service]
 name = "elowen-edge"

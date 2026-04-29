@@ -52,6 +52,12 @@ elowen-edge config import-env --env-file .\edge.env.local --config .\edge.toml
 
 The runtime no longer accepts `--env-file` or `ELOWEN_EDGE_ENV_FILE`; those are migration inputs only.
 
+Import an existing plaintext edge key into a provider-backed secret file with:
+
+```powershell
+elowen-edge trust import-key --from .\secrets\edge-signing-key.txt --to .\secrets\edge-signing-key.dpapi --provider dpapi
+```
+
 Generate trust key material with:
 
 ```powershell
@@ -68,11 +74,11 @@ Start from `edge.toml.example`. The main sections are:
 - `[device]` for stable device identity and advertised capabilities
 - `[repositories]` for workspace, worktree, repo roots, hidden repos, and explicit repo overlays
 - `[runner]` for Codex command, extra args, validation timeout, and sandbox mode
-- `[trust]` for paths to local trust material
+- `[trust]` for the orchestrator trust bundle and edge key secret providers
 - `[runtime]` for status/log configuration
 - `[service]` and `[tunnel]` for operator service setup
 
-Secrets are stored in separate local files and referenced from TOML. On Unix-like hosts, secret files must not be group- or world-readable. Keep the TOML config and the `secrets/` directory out of git.
+Secrets are stored outside the TOML file and referenced through explicit providers. Use `dpapi` for Windows protected local storage, `file` for Linux/VPS/container secret mounts, and the legacy `edge_signing_key_path` fields only as compatibility aliases. On Unix-like hosts, file-provider secrets must not be group- or world-readable unless `ELOWEN_EDGE_ALLOW_BROAD_SECRET_PERMISSIONS` is set for dev/test. Keep the TOML config and the `secrets/` directory out of git.
 
 The trust bundle file is JSON:
 
@@ -82,7 +88,19 @@ The trust bundle file is JSON:
 ]
 ```
 
-The edge signing key files contain a single base64url private key each.
+File-provider edge signing key files contain a single base64url private key each. DPAPI-provider files contain Windows user-protected encrypted bytes and are not portable to another account or machine.
+
+Provider-backed edge key TOML:
+
+```toml
+[trust.edge_signing_key]
+provider = "dpapi"
+path = "secrets\\edge-signing-key.dpapi"
+
+[trust.previous_edge_signing_key]
+provider = "dpapi"
+path = "secrets\\previous-edge-signing-key.dpapi"
+```
 
 On Windows, prefer an absolute path to the executable shim that actually runs from a background task. The Microsoft Store app path under `C:\Program Files\WindowsApps` may be visible but can fail with `Access is denied`; the npm shim is usually the usable path:
 
@@ -108,7 +126,7 @@ The TUI is a local operator console. It supports:
 - first-run checklist for orchestrator, device identity, work exposure, Codex, trust, and service install
 - config validation with reload via `Shift+R`
 - service install/start/stop/restart controls
-- diagnostics for config parsing, secret-file access, and Codex preflight
+- diagnostics for config parsing, secret-provider access, trust bundle health, and Codex preflight
 
 The TUI intentionally edits through the TOML file rather than inventing a second storage path. Use your editor for detailed field edits, then reload the TUI.
 
@@ -179,9 +197,9 @@ Recommended operator setup:
 
 1. Keep one TOML config and one secret directory per device.
 2. Pin the orchestrator trust bundle with `[trust].orchestrator_keys_path`.
-3. Store the edge private key in `[trust].edge_signing_key_path`.
-4. During edge signing-key rotation, set `[trust].previous_edge_signing_key_path` only for the re-enrollment window.
-5. After the API confirms the new edge key is trusted, remove the previous key path.
+3. Store the edge private key through `[trust.edge_signing_key]`; use `dpapi` on Windows and `file` for mounted Linux/container secrets.
+4. During edge signing-key rotation, set `[trust.previous_edge_signing_key]` only for the re-enrollment window.
+5. After the API confirms the new edge key is trusted, remove the previous-key provider.
 
 Slice 42 trust lifecycle support makes the orchestrator authoritative for
 dispatch eligibility. A device in `rotated`, `revoked`, `untrusted`, or
@@ -191,8 +209,8 @@ registration failure guidance when the API reports trust errors:
 
 - `device_trust_revoked` or `edge_key_revoked`: stop this edge identity and use the orchestrator admin UI to clear revocation or re-enroll with fresh key material.
 - `orchestrator_signer_retired` or `orchestrator_signer_untrusted`: update `orchestrator-trust.json` with the active signer bundle.
-- `rotation_previous_key_mismatch` or `rotation_previous_signature_invalid`: restore `[trust].previous_edge_signing_key_path` during the rotation window, then confirm rotation in the orchestrator admin UI.
-- `trusted_registration_required`: configure the trust bundle and edge signing key paths before starting the service.
+- `rotation_previous_key_mismatch` or `rotation_previous_signature_invalid`: restore `[trust.previous_edge_signing_key]` during the rotation window, then confirm rotation in the orchestrator admin UI.
+- `trusted_registration_required`: configure the trust bundle and edge signing-key provider before starting the service.
 
 ## Local Verification
 
